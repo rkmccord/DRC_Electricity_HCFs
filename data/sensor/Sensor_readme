@@ -1,0 +1,4 @@
+This directory is reserved for restricted-access sensor data used in the analysis.
+
+Authorized users should place the processed monthly sensor dataset (e.g., pqr_climate_DRC.csv) in this folder.
+These data are not included in the public repository due to data-sharing agreements. Please directly contact the authors if you need access to these data.

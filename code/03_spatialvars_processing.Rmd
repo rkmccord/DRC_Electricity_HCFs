@@ -1,0 +1,238 @@
+---
+title: "Spatial Data Preparation - Aggregate to Health Zone Level"
+output: html_document
+date: "2025-08-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+```{r libs, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(terra)
+library(sf)
+library(exactextractr)
+library(osmextract)
+library(dplyr)
+library(readr)
+library(lubridate)
+
+library(ggplot2)
+library(viridis)
+
+```
+
+## Read in Data
+
+```{r readdata, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+# -------------------------------------------------------------------
+
+# USER: Set this to the root folder of the cloned repository
+
+# -------------------------------------------------------------------
+
+project_dir <- "/path/to/DRC_Electricity_HCFs"
+
+data_dir    <- file.path(project_dir, "data")
+spatial_dir <- file.path(data_dir, "spatial")
+output_dir     <- file.path(data_dir, "temp")
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ===================================================================================
+# NOTE TO REPLICATORS
+#
+# The following files must be downloaded manually into:
+#   data/spatial/
+#
+# rdc_zone_de_sante_09092019.zip      (DRC health zones shapefile)
+# cod_ppp_2020.tif                    (WorldPop population raster)
+# cod_relative_wealth_index.csv       (Meta RWI dataset)
+# acled_drcconflictdata.csv           (ACLED conflict events)
+#
+# These files are too large to store on GitHub. See the readme file for more details.
+# ===================================================================================
+```
+
+```{r shapefile, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ------------------ Load & Prepare Health Zones ------------------
+zipfile <- file.path(spatial_dir, "rdc_zone_de_sante_09092019.zip")
+unzip(zipfile, exdir = file.path(spatial_dir, "hz_unzipped"))
+
+shp_file <- list.files(
+  file.path(spatial_dir, "hz_unzipped"),
+  pattern = "\\.shp$", full.names = TRUE
+)
+
+health_zones <- st_read(shp_file) |>
+  st_transform(4326) |>
+  st_make_valid()
+
+target_provinces <- c("Nord-Kivu", "Sud-Kivu", "Haut-Katanga")
+
+hz_subset <- health_zones |>
+  filter(PROVINCE %in% target_provinces) |>
+  select(Nom, PROVINCE)
+
+```
+
+```{r wealth, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+# ------------------ Load Wealth CSV and Convert to sf ------------------
+wealth_file <- file.path(spatial_dir, "cod_relative_wealth_index.csv")
+wealth_df <- read_csv(wealth_file)
+
+# Check column names — should include "latitude", "longitude", "rwi"
+names(wealth_df)
+
+# Convert to sf
+wealth_sf <- st_as_sf(wealth_df, coords = c("longitude", "latitude"), crs = 4326)
+
+# ------------------ Spatial Join & Aggregation ------------------
+# Spatial join to assign each RWI point to a health zone
+wealth_joined <- st_join(wealth_sf, health_zones, join = st_within)
+
+# Aggregate: mean RWI per zone
+wealth_by_zone <- wealth_joined %>%
+  st_drop_geometry() %>%
+  group_by(Nom) %>%  
+  summarise(wealth_mean = mean(rwi, na.rm = TRUE))
+
+```
+
+```{r popdensity, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ------------------ Load Population Raster ------------------
+pop_raster <- rast(file.path(spatial_dir, "cod_ppp_2020.tif"))
+
+# Crop and mask to DRC health zones
+hz_vect_sub <- vect(hz_subset)
+pop_crop <- crop(pop_raster, hz_vect_sub)
+pop_masked <- mask(pop_crop, hz_vect_sub)
+
+# ------------------ Extract Mean Population Density ------------------
+# Note: This is people per 100m x 100m cell, so mean is already interpretable
+pop_mean_df <- data.frame(pop_density_mean = exact_extract(pop_masked, hz_subset, 'mean'))
+
+
+# ------------------ Merge with Existing Wealth Data ------------------
+zone_names <- hz_subset %>% st_drop_geometry() %>% select(Nom, PROVINCE)
+
+spatial_covariates <- zone_names %>%
+  left_join(wealth_by_zone, by = "Nom") %>%
+  bind_cols(pop_density_mean = pop_mean_df$pop_density_mean)
+```
+
+
+```{r roads, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ------------------ Road Access (distance to paved road, road density) ------------------
+# Download OSM lines for DRC
+roads <- oe_get("Democratic Republic of the Congo",
+                layer = "lines",
+                extra_tags = c("highway","surface","tracktype"))
+
+# Keep only relevant road types
+roads <- roads %>% filter(!is.na(highway))
+
+# Classify paved
+paved <- c("asphalt","concrete","paved","chipseal","paving_stones")
+major <- c("motorway","trunk","primary","secondary")
+
+roads <- roads %>%
+  mutate(is_paved = case_when(
+    !is.na(surface) & tolower(surface) %in% paved ~ TRUE,
+    tolower(highway) %in% major ~ TRUE,
+    TRUE ~ FALSE
+  ))
+
+# Reproject for distances (equal area)
+ea_crs <- "EPSG:6933"
+hz_ea <- st_transform(hz_subset, ea_crs)
+roads_ea <- st_transform(roads, ea_crs)
+
+# Distance to nearest paved road (zone centroid)
+hz_pts <- st_point_on_surface(hz_ea)
+paved_lines <- roads_ea %>% filter(is_paved)
+nn <- st_distance(hz_pts, paved_lines)
+dist_km <- apply(nn, 1, min) / 1000
+road_dist_df <- data.frame(dist_paved_km = dist_km)
+
+road_dist_df <- data.frame(
+  Nom = hz_ea$Nom,              # zone names from your shapefile
+  dist_paved_km = dist_km       # distance in km
+)
+
+spatial_covariates <- spatial_covariates %>%
+  left_join(road_dist_df, by = "Nom")
+```
+
+
+```{r conflict, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ------------------ Load ACLED Conflict Data ------------------
+acled_file <- file.path(spatial_dir, "acled_drcconflictdata.csv")
+acled <- read_csv(acled_file)
+
+# Convert to sf using lat/long
+acled_sf <- st_as_sf(acled, coords = c("longitude", "latitude"), crs = 4326)
+
+# Spatial join to health zones
+acled_joined <- st_join(acled_sf, hz_subset, join = st_within)
+
+# Keep only relevant variables
+acled_clean <- acled_joined %>%
+  st_drop_geometry() %>%
+  mutate(
+    # Parse event_date (ACLED is month/day/year)
+    event_date = mdy(event_date),
+    year = year(event_date),
+    month = month(event_date),  # numeric month (1–12)
+    year_month = format(event_date, "%Y-%m"),  # YYYY-MM for merging
+    health_zone = Nom,
+    province = PROVINCE
+  )
+
+# ------------------ Aggregate to health zone x year x month ------------------
+acled_agg <- acled_clean %>%
+  group_by(province, health_zone, year, month, year_month) %>%
+  summarise(
+    n_events = n(),
+    n_fatalities = sum(fatalities, na.rm = TRUE),
+    n_civilian = sum(civilian_targeting, na.rm = TRUE),
+    any_event = as.integer(n_events > 0),
+    any_fatalities = as.integer(n_fatalities > 0),
+    .groups = "drop"
+  )
+
+conflict_static <- acled_agg %>%
+  group_by(province, health_zone) %>%
+  summarise(
+    mean_events = median(n_events, na.rm = TRUE),
+    mean_fatalities = median(n_fatalities, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+spatial_covariates <- spatial_covariates %>%
+  left_join(conflict_static,
+            by = c("Nom" = "health_zone", "PROVINCE" = "province")) %>%
+  group_by(PROVINCE) %>%
+  mutate(
+    mean_events = ifelse(is.na(mean_events),
+                                  median(mean_events, na.rm = TRUE),
+                                  mean_events),
+    mean_fatalities = ifelse(is.na(mean_fatalities),
+                                      median(mean_fatalities, na.rm = TRUE),
+                                      mean_fatalities)
+  ) %>%
+  ungroup()
+
+
+write_csv(
+  spatial_covariates,
+  file.path(output_dir, "health_zone_spatial_covariates.csv")
+)
+
+write_csv(
+  acled_agg,
+  file.path(output_dir, "conflict_timevarying.csv")
+)
+```

@@ -1,0 +1,510 @@
+---
+title: "DRC2_datacleaning_prep_July2025"
+output: html_document
+date: "2025-07-01"
+---
+#NOTE: This script relies on restricted-access SNIS, survey, and sensor data, which are not included in the repository. Users with appropriate access should place these files in the data/ subdirectories following the documented structure.
+
+```{r libs, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(readxl)
+library(dplyr)
+library(stringr)
+library(zoo)
+library(tidyr)
+library(purrr)
+library(lubridate)
+library(ggplot2)
+
+# ============================================================
+# Project paths (relative to repository root)
+# ============================================================
+
+library(here)
+
+# Ensure knitting always runs from repo root
+knitr::opts_knit$set(root.dir = here())
+
+code_dir    <- here("code")
+data_dir    <- here("data")
+sensor_dir  <- here("data", "sensor")
+snis_dir    <- here("data", "snis")
+survey_dir  <- here("data", "survey")
+
+output_dir  <- here("output")
+temp_dir    <- here("output", "temp")
+
+dir.create(temp_dir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+## Read in data
+
+```{r data, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+snis_filepath <- file.path(
+  snis_dir,
+  "SNIS_NK_HK_SK_2025.xls"
+)
+
+if (!file.exists(snis_filepath)) {
+  stop("SNIS data file not found. Expected in data/snis/.")
+}
+
+# Import variable labels 
+var_labels <- read_excel(snis_filepath, range = "A1:HK1", col_names = FALSE)
+col_labels_vec <- as.character(var_labels[1, ])
+col_types_vec <- rep("numeric", length(col_labels_vec))
+
+# Specify which to read in as characters (everything else is numeric)
+period_col <- which(col_labels_vec == "periodname")
+orgunit_col <- which(col_labels_vec == "organisationunitname")
+col_types_vec[c(period_col, orgunit_col)] <- "text"
+
+# Import data
+snis_RAW <- read_excel(snis_filepath, skip = 1, col_types = col_types_vec)
+
+# Assign column names
+colnames(snis_RAW) <- col_labels_vec
+
+```
+
+# Create date, province, facility type, and numeric ID variables
+```{r tags, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# French to English month mapping
+month_mapping <- c(
+  "Janvier" = "January", "Février" = "February", "Mars" = "March",
+  "Avril" = "April", "Mai" = "May", "Juin" = "June",
+  "Juillet" = "July", "Août" = "August", "Septembre" = "September",
+  "Octobre" = "October", "Novembre" = "November", "Décembre" = "December"
+)
+
+# Replace French month names
+for (french_month in names(month_mapping)) {
+  snis_RAW$periodname <- str_replace_all(snis_RAW$periodname, french_month, month_mapping[[french_month]])
+}
+
+# Convert to yearmon
+snis_RAW$month <- as.yearmon(snis_RAW$periodname, format = "%B %Y") #yearmon object
+
+snis_RAW$month_date <- as.Date(snis_RAW$month) #date object
+
+# Create variable for province name
+snis_RAW <- snis_RAW %>%
+  mutate(
+    province = case_when(
+      str_sub(organisationunitname, 1, 2) == "hk" ~ "Haut Katanga",
+      str_sub(organisationunitname, 1, 2) == "sk" ~ "South Kivu",
+      str_sub(organisationunitname, 1, 2) == "nk" ~ "North Kivu",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Create variable for facility type
+snis_RAW <- snis_RAW %>%
+  mutate(
+    facilitytype = case_when(
+      str_detect(organisationunitname, fixed("Hôpital Général de Référence", ignore_case = TRUE)) ~ "HGR",
+      str_detect(organisationunitname, fixed("Hôpital Provincial de Référence", ignore_case = TRUE)) ~ "PH",
+      str_detect(organisationunitname, fixed("Centre de Santé de Référence", ignore_case = TRUE)) ~ "CSR",
+      str_detect(organisationunitname, fixed("Centre Hospitalier", ignore_case = TRUE)) ~ "CH",
+      str_detect(organisationunitname, fixed("Centre Médical", ignore_case = TRUE)) ~ "CM",
+      str_detect(organisationunitname, fixed("Hôpital", ignore_case = TRUE)) ~ "H",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+sum(is.na(snis_RAW$facilitytype)) #These should not have downloaded - remove them
+snis_RAW %>%
+  filter(is.na(facilitytype)) %>%
+  select(organisationunitname) %>%
+  distinct() %>%
+  head(50)
+
+snis_RAW <- snis_RAW %>%
+  filter(!is.na(facilitytype))
+
+# Create unique ID
+snis_RAW <- snis_RAW %>%
+  mutate(id = as.numeric(factor(str_trim(organisationunitname))))
+
+snis_RAW %>%
+  distinct(id, province, facilitytype) %>%
+  count(province, facilitytype)
+```
+
+# Clean up missing values
+```{r zeros, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# 1. Remove J 9.6 variables
+snis_cleaned <- snis_RAW %>%
+  select(-starts_with("J 9.6"))
+
+# 2. Identify numeric variables (excluding metadata)
+numeric_vars <- snis_cleaned %>%
+  select(-periodname, -organisationunitname, -id) %>%
+  select(where(is.numeric)) %>%
+  colnames()
+
+# 3. Replace NA with 0 for specified variables
+vars_to_zero <- snis_cleaned %>%
+  select(
+    starts_with("D 8.2"), starts_with("D 9.6"),
+    starts_with("D 11.1"), starts_with("D 11.2"),
+    starts_with("D 2.4"),
+    "A 2.3 Mort-nés frais",
+    "A 2.3 Mort-nés macérés", 
+    "A 2.3 Accouchées avec complications obstétricales",
+    "A 2.3 Accouchées référées l'HGR",
+    "A 2.4 Décès nouveaux-nés ≤ 28 jours"
+  ) %>%
+  colnames()
+
+snis_cleaned <- snis_cleaned %>%
+  mutate(across(all_of(vars_to_zero), ~ ifelse(is.na(.), 0, .)))
+
+
+# 4.: Create new variables with facility-level averages, preserving originals
+
+snis_cleaned <- snis_cleaned %>%
+  group_by(id) %>%
+  mutate(
+    bedcount = if (all(is.na(`D 8.1 Nombre des lits montés`))) NA_real_ else mean(`D 8.1 Nombre des lits montés`, na.rm = TRUE),
+    nursecount_A1 = if (all(is.na(`A 4.7 Infirmier A1 Agents`))) NA_real_ else mean(`A 4.7 Infirmier A1 Agents`, na.rm = TRUE),
+    nursecount_A2 = if (all(is.na(`A 4.7 Infirmier A2 Agents`))) NA_real_ else mean(`A 4.7 Infirmier A2 Agents`, na.rm = TRUE),
+    doctorcount = if (all(is.na(`A 4.7 Médecin généraliste Agents`))) NA_real_ else mean(`A 4.7 Médecin généraliste Agents`, na.rm = TRUE),
+    labtechcount = if (all(is.na(`A 4.7 Technicien de labo A2/A1/L2 - agents`))) NA_real_ else mean(`A 4.7 Technicien de labo A2/A1/L2 - agents`, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# 5.: Imputation for certain variables 
+
+impute_vars <- c(
+  "A 4.7 Infirmier A1 Jours de travail préstés", "A 4.7 Infirmier A1 Jours de travail prévus",
+  "A 4.7 Infirmier A2 Jours de travail préstés", "A 4.7 Infirmier A2 Jours de travail prévus",
+  "A 4.7 Médecin généraliste Jours de travail préstés", "A 4.7 Médecin généraliste Jours de travail prévus",
+  "A 4.7 Technicien de labo A2/A1/L2 - travail preste", "A 4.7 Technicien de labo A2/A1/L2 - travail prevu",
+  grep("^A 1.2.1", names(snis_cleaned), value = TRUE),
+  "A 1.3 Nouveaux cas femmes enceintes", 
+  "A 2.3 Accouchements", "A 2.3 Accouchements par personnel qualifié", 
+  "A 2.3 Naissances vivantes",
+  grep("^D 8.1", names(snis_cleaned), value = TRUE),
+  grep("^D 8.2", names(snis_cleaned), value = TRUE)
+)
+
+snis_cleaned <- snis_cleaned %>%
+  group_by(id) %>%
+  mutate(across(all_of(impute_vars), 
+                ~ if (all(is.na(.))) NA_real_ else ifelse(is.na(.), mean(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+# 6.: Deal with remaining D 6.2 and D 6.3 vars (only relevant for hospitals)
+
+impute_vars <- c(
+  "D 6.2 Nouveaux cas vus aux urgences",
+  "D 6.3 Cas Référé par le CS",
+  "D 6.3 Consultations Hospitalisés"
+)
+
+zero_replace_vars <- c(
+  "D 6.2 Nouveaux cas vus aux urgences Détresse respiratoire",
+  "D 6.2 Décès aux urgences"
+)
+
+all_d62_d63_vars <- c(impute_vars, zero_replace_vars)
+relevant_types <- c("CH", "H", "HGR", "PH")
+
+snis_cleaned <- snis_cleaned %>%
+  group_by(id) %>%
+  mutate(across(all_of(all_d62_d63_vars), 
+                ~ case_when(
+                  !facilitytype %in% relevant_types ~ NA_real_,
+                  cur_column() %in% impute_vars ~ if (all(is.na(.))) NA_real_ else ifelse(is.na(.), mean(., na.rm = TRUE), .),
+                  cur_column() %in% zero_replace_vars ~ if (all(is.na(.))) NA_real_ else ifelse(is.na(.), 0, .),
+                  TRUE ~ .
+                ))) %>%
+  ungroup()
+```
+
+# Create outcome variables
+```{r varcreation, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+snis_cleaned <- snis_cleaned %>%
+  mutate(
+    # Patient counts
+    outpatientcount = rowSums(select(., starts_with("A 1.2.1")), na.rm = TRUE),
+    inpatientcount_active = rowSums(select(., contains("Malades en hospitalisation au début du mois")), na.rm = TRUE),
+    inpatientcount_new = rowSums(select(., contains("Malades admis au cours du mois")), na.rm = TRUE),
+    inpatientcount_complete = rowSums(select(., contains("Sortants du mois")), na.rm = TRUE),
+
+    # Death totals
+    totaldeaths_9.6 = rowSums(select(., starts_with("D 9.6")), na.rm = TRUE),
+    totaldeaths_8.2 = rowSums(select(., contains("Issues des hospitalisés-Décès")), na.rm = TRUE),
+
+    # Discrepancy and mortality rates
+    deathdiscrepancy = totaldeaths_9.6 - totaldeaths_8.2,
+   mortrate_active = ifelse(
+  inpatientcount_active > 0 & (totaldeaths_8.2 / inpatientcount_active)*100 <= 60, 
+  (totaldeaths_8.2 / inpatientcount_active)*100, 
+  NA_real_
+),
+mortrate_complete = ifelse(
+  inpatientcount_complete > 0 & (totaldeaths_8.2 / inpatientcount_complete)*100 <= 60, 
+  (totaldeaths_8.2 / inpatientcount_complete)*100, 
+  NA_real_
+),
+mortrate_new = ifelse(
+  inpatientcount_new > 0 & (totaldeaths_8.2 / inpatientcount_new)*100 <= 60,
+  (totaldeaths_8.2 / inpatientcount_new)*100,
+  NA_real_
+),
+
+    #Mortality rates by ward
+    surgicaldeaths = rowSums(select(., `D 8.2 Issues des hospitalisés-Décès après 48 h Chirurgie`, `D 8.2 Issues des hospitalisés-Décès avant 48 h Chirurgie`), na.rm = TRUE),
+    obgyndeaths = rowSums(select(., `D 8.2 Issues des hospitalisés-Décès après 48 h Gyn. Obst`, `D 8.2 Issues des hospitalisés-Décès avant 48 h Gyn. Obst`), na.rm = TRUE),
+    pedsdeaths = rowSums(select(., `D 8.2 Issues des hospitalisés-Décès après 48 h Pédiatrie`, `D 8.2 Issues des hospitalisés-Décès avant 48 h Pédiatrie`), na.rm = TRUE),
+    internalmeddeaths = rowSums(select(., `D 8.2 Issues des hospitalisés-Décès après 48 h Méd. Interne`, `D 8.2 Issues des hospitalisés-Décès avant 48 h Méd. Interne`), na.rm = TRUE),
+    resuscitationdeaths = rowSums(select(., `D 8.2 Issues des hospitalisés-Décès après 48 h Réanimation Urgence`, `D 8.2 Issues des hospitalisés-Décès avant 48 h Réanimation Urgence`), na.rm = TRUE),
+    specialitydeaths = rowSums(select(., `D 8.2 Issues des hospitalisés-Décès après 48 h Spécialité`, `D 8.2 Issues des hospitalisés-Décès avant 48 h Spécialité`), na.rm = TRUE),
+
+    mortrate_surgical = ifelse(`D 8.1 Malades en hospitalisation au début du mois Chirurgie` > 0 & (surgicaldeaths /`D 8.1 Malades en hospitalisation au début du mois Chirurgie`)*100 <= 75, 
+  (surgicaldeaths / `D 8.1 Malades en hospitalisation au début du mois Chirurgie`)*100, 
+  NA_real_
+    ),
+    mortrate_obgyn = ifelse(`D 8.1 Malades en hospitalisation au début du mois Gyn. Obst` > 0 & (obgyndeaths /`D 8.1 Malades en hospitalisation au début du mois Gyn. Obst`)*100 <= 75, 
+  (obgyndeaths / `D 8.1 Malades en hospitalisation au début du mois Gyn. Obst`)*100, 
+  NA_real_
+    ), 
+    mortrate_peds = ifelse(`D 8.1 Malades en hospitalisation au début du mois Pédiatrie` > 0 & (pedsdeaths /`D 8.1 Malades en hospitalisation au début du mois Pédiatrie`)*100 <= 75, 
+  (pedsdeaths / `D 8.1 Malades en hospitalisation au début du mois Pédiatrie`)*100, 
+  NA_real_
+    ), 
+    mortrate_internalmed = ifelse(`D 8.1 Malades en hospitalisation au début du mois Méd. Interne` > 0 & (internalmeddeaths /`D 8.1 Malades en hospitalisation au début du mois Méd. Interne`)*100 <= 75, 
+  (internalmeddeaths / `D 8.1 Malades en hospitalisation au début du mois Méd. Interne`)*100, 
+  NA_real_
+    ), 
+    mortrate_resuscitation = ifelse(`D 8.1 Malades en hospitalisation au début du mois Réanimation Urgence` > 0 & (resuscitationdeaths /`D 8.1 Malades en hospitalisation au début du mois Réanimation Urgence`)*100 <= 75, 
+  (resuscitationdeaths / `D 8.1 Malades en hospitalisation au début du mois Réanimation Urgence`)*100, 
+  NA_real_
+    ), 
+    mortrate_specialty = ifelse(`D 8.1 Malades en hospitalisation au début du mois Spécialité` > 0 & (specialitydeaths /`D 8.1 Malades en hospitalisation au début du mois Spécialité`)*100 <= 75, 
+  (specialitydeaths / `D 8.1 Malades en hospitalisation au début du mois Spécialité`)*100, 
+  NA_real_
+    ), 
+
+    # Patient counts
+    surgical_count     = `D 8.1 Malades en hospitalisation au début du mois Chirurgie`,
+    obgyn_count        = `D 8.1 Malades en hospitalisation au début du mois Gyn. Obst`,
+    peds_count         = `D 8.1 Malades en hospitalisation au début du mois Pédiatrie`,
+    internalmed_count  = `D 8.1 Malades en hospitalisation au début du mois Méd. Interne`,
+
+    # Delivery outcomes
+    livebirths = `A 2.3 Naissances vivantes`,
+    deliveries = `A 2.3 Accouchements`,
+    stillbirths = `A 2.3 Mort-nés frais` + `A 2.3 Mort-nés macérés`,
+    maternalmort = ifelse(deliveries > 0, (`A 2.4 Décès maternels` / deliveries)*100, NA_real_),
+    neonatalmort = ifelse(deliveries > 0, (`A 2.4 Décès nouveaux-nés ≤ 28 jours` / deliveries)*100, NA_real_),
+
+    # Staffing
+    nurse_A1 = `A 4.7 Infirmier A1 Jours de travail prévus`,
+    nurse_A2 = `A 4.7 Infirmier A2 Jours de travail prévus`,
+    doctor = `A 4.7 Médecin généraliste Jours de travail prévus`,
+    labtech = `A 4.7 Technicien de labo A2/A1/L2 - travail prevu`, 
+
+    # Staff attendance rates
+    nurse_A1_attendrate = ifelse(
+      `A 4.7 Infirmier A1 Jours de travail prévus` > 0,
+      (`A 4.7 Infirmier A1 Jours de travail préstés` /
+      `A 4.7 Infirmier A1 Jours de travail prévus`),
+     NA_real_
+    ),
+        nurse_A2_attendrate = ifelse(
+      `A 4.7 Infirmier A2 Jours de travail prévus` > 0,
+      `A 4.7 Infirmier A2 Jours de travail préstés` /
+        `A 4.7 Infirmier A2 Jours de travail prévus`,
+      NA_real_
+    ),
+    doctor_attendrate = ifelse(
+      `A 4.7 Médecin généraliste Jours de travail prévus` > 0,
+      `A 4.7 Médecin généraliste Jours de travail préstés` /
+        `A 4.7 Médecin généraliste Jours de travail prévus`,
+      NA_real_
+    ),
+    labtech_attendrate = ifelse(
+      `A 4.7 Technicien de labo A2/A1/L2 - travail prevu` > 0,
+      `A 4.7 Technicien de labo A2/A1/L2 - travail preste` /
+        `A 4.7 Technicien de labo A2/A1/L2 - travail prevu`,
+      NA_real_
+    ),
+
+    # Surgical mortality rate
+    surgmortrate = ifelse(
+  (`D 8.2 Issues des hospitalisés-Décès avant 48 h Chirurgie` + `D 8.2 Issues des hospitalisés-Décès après 48 h Chirurgie`) > 0,
+  ((`D 8.2 Issues des hospitalisés-Sortants du mois dont (b) Chirurgie`) /
+    (`D 8.2 Issues des hospitalisés-Décès avant 48 h Chirurgie` + `D 8.2 Issues des hospitalisés-Décès après 48 h Chirurgie`))*100,
+  NA_real_
+),
+
+    # Respiratory emergency mortality rate
+    respemerg_mortrate = ifelse(
+      `D 6.2 Nouveaux cas vus aux urgences Détresse respiratoire` > 0,
+      (`D 6.2 Décès aux urgences`/`D 6.2 Nouveaux cas vus aux urgences Détresse respiratoire`)*100,
+      NA_real_
+    ),
+
+    # Referrals received (renamed)
+    referralsreceived = `D 6.3 Cas Référé par le CS`
+  )
+
+
+snis_analytical <- snis_cleaned %>%
+  select(
+    id, organisationunitname, facilitytype, province, month, month_date,
+    
+    bedcount, nursecount_A1, nursecount_A2, doctorcount, labtechcount,
+    
+    outpatientcount, inpatientcount_active, inpatientcount_complete, totaldeaths_9.6, totaldeaths_8.2, deathdiscrepancy,
+    mortrate_active, mortrate_complete, mortrate_new, livebirths, deliveries, stillbirths,
+    maternalmort, neonatalmort,
+    mortrate_surgical, mortrate_obgyn, mortrate_peds, mortrate_internalmed, mortrate_resuscitation, mortrate_specialty,
+    nurse_A1_attendrate, nurse_A2_attendrate, doctor_attendrate, labtech_attendrate,
+    surgmortrate, respemerg_mortrate,
+    referralsreceived, surgicaldeaths, obgyndeaths, pedsdeaths, internalmeddeaths, surgical_count, obgyn_count, peds_count, internalmed_count, nurse_A1, nurse_A2, doctor, labtech
+  )
+
+
+
+facilities_all_zero_df <- snis_analytical %>%
+  filter(!is.na(mortrate_active)) %>%
+  group_by(id, facilitytype) %>%
+  summarise(all_zero = all(mortrate_active == 0), .groups = "drop") %>%
+  filter(all_zero) %>%
+  count(facilitytype, name = "facilities_all_zero")
+
+facilities_all_missing_df <- snis_analytical %>%
+  group_by(id, facilitytype) %>%
+  summarise(all_missing = all(is.na(mortrate_active)), .groups = "drop") %>%
+  filter(all_missing) %>%
+  count(facilitytype, name = "facilities_all_missing")
+
+facility_counts_df <- snis_analytical %>%
+  distinct(id, facilitytype) %>%
+  count(facilitytype, name = "total_facilities")
+
+# Main summary table
+summary_table <- snis_analytical %>%
+  group_by(facilitytype) %>%
+  summarise(
+    zero_values = sum(mortrate_active == 0, na.rm = TRUE),
+    mean_count = round(mean(totaldeaths_8.2, na.rm = TRUE), 2),
+    mean_rate = round(mean(mortrate_active, na.rm = TRUE), 2),
+    median = round(median(mortrate_active, na.rm = TRUE), 2),
+    min = round(min(mortrate_active, na.rm = TRUE), 2),
+    max = round(max(mortrate_active, na.rm = TRUE), 2),
+    sd = round(sd(mortrate_active, na.rm = TRUE), 2)
+  ) %>%
+  left_join(facilities_all_zero_df, by = "facilitytype") %>%
+  left_join(facilities_all_missing_df, by = "facilitytype") %>%
+  left_join(facility_counts_df, by = "facilitytype") %>%
+  replace_na(list(facilities_all_zero = 0,
+                  facilities_all_missing = 0,
+                  total_facilities = 0)) %>%
+  arrange(desc(mean_rate))
+
+
+##
+facilities_all_zero_df2 <- snis_analytical %>%
+  filter(!is.na(mortrate_complete)) %>%
+  group_by(id, facilitytype) %>%
+  summarise(all_zero = all(mortrate_complete == 0), .groups = "drop") %>%
+  filter(all_zero) %>%
+  count(facilitytype, name = "facilities_all_zero")
+
+facilities_all_missing_df2 <- snis_analytical %>%
+  group_by(id, facilitytype) %>%
+  summarise(all_missing = all(is.na(mortrate_complete)), .groups = "drop") %>%
+  filter(all_missing) %>%
+  count(facilitytype, name = "facilities_all_missing")
+
+facility_counts_df2 <- snis_analytical %>%
+  distinct(id, facilitytype) %>%
+  count(facilitytype, name = "total_facilities")
+
+# Main summary table
+summary_table2 <- snis_analytical %>%
+  group_by(facilitytype) %>%
+  summarise(
+    zero_values = sum(mortrate_complete == 0, na.rm = TRUE),
+    mean_count = round(mean(totaldeaths_8.2, na.rm = TRUE), 2),
+    mean_rate = round(mean(mortrate_complete, na.rm = TRUE), 2),
+    median = round(median(mortrate_complete, na.rm = TRUE), 2),
+    min = round(min(mortrate_complete, na.rm = TRUE), 2),
+    max = round(max(mortrate_complete, na.rm = TRUE), 2),
+    sd = round(sd(mortrate_complete, na.rm = TRUE), 2)
+  ) %>%
+  left_join(facilities_all_zero_df2, by = "facilitytype") %>%
+  left_join(facilities_all_missing_df2, by = "facilitytype") %>%
+  left_join(facility_counts_df2, by = "facilitytype") %>%
+  replace_na(list(facilities_all_zero = 0,
+                  facilities_all_missing = 0,
+                  total_facilities = 0)) %>%
+  arrange(desc(mean_rate))
+
+
+zero_mort_ids_snis <- snis_analytical %>%
+  group_by(id) %>%
+  summarise(all_zero = all(mortrate_active == 0, na.rm = TRUE)) %>%
+  filter(all_zero) %>%
+  pull(id)
+
+zero_mort_facilities_snis <- snis_analytical %>%
+  filter(id %in% zero_mort_ids_snis) %>%
+  select(id, organisationunitname, facilitytype, province) %>%
+  distinct(id, .keep_all = TRUE)
+
+
+
+
+```
+
+
+
+# Merge with survey data
+```{r merge, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+survey_filepath2 <- file.path(
+  survey_dir,
+  "Survey.xlsx"
+)
+
+survey_labels2 <- read_excel(survey_filepath2, range = "A1:DQ1", col_names = FALSE)  
+survey_col_labels2 <- as.character(survey_labels2[1, ])
+
+survey <- read_excel(survey_filepath2, skip = 1, col_types = "text")
+colnames(survey) <- survey_col_labels2
+
+# Fix how the dates are read in
+survey <- survey %>%
+  mutate(across(
+    ends_with("_date"),
+    ~ as.Date(as.numeric(.x), origin = "1899-12-30")
+  ))
+
+# Make vars numeric that should be
+survey <- survey %>%
+  mutate(across(
+    everything(),
+    ~ if (all(is.na(.x) | grepl("^\\d+(\\.\\d+)?$", .x))) as.numeric(.x) else .x
+  ))
+
+survey_unique <- survey %>%
+  distinct(organisationunitname, .keep_all = TRUE)
+
+snis_analytical_tmle2 <- snis_analytical %>%
+  left_join(survey_unique, by = "organisationunitname")
+
+saveRDS(
+  snis_analytical_tmle2,
+  file = file.path(output_dir, "snis_analytical_FINAL.rds")
+)
+
+```
+
+

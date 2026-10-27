@@ -1,0 +1,6 @@
+This directory is reserved for restricted-access raw SNIS (Système National d’Information Sanitaire) health facility data used in this study.
+
+Due to data-sharing agreements, SNIS files are not included in the public repository. Access to data for each province has been provided to the research team through individual agreements with the Provincial Health Departments. 
+If you gain access, you should place the raw SNIS Excel files in this folder using the filenames expected by the cleaning scripts (see code/02_sniscleaning_surveymerge.Rmd).
+
+All SNIS data cleaning, variable construction, and aggregation steps are fully documented and reproducible using the provided code.

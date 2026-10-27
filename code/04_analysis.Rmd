@@ -1,0 +1,1928 @@
+
+---
+title: "Assessing the Impacts of Sufficient and Reliable Power at Healthcare Facilities - Replication Code"
+output: html_document
+date: "2025-09-16"
+editor_options: 
+  chunk_output_type: console
+---
+
+# To reproduce the analysis, users must place restricted SNIS and sensor data files in the data / subdirectories specified below and spatial data must be downloaded per the instructions in the Readme. The code will not run if the data are not present.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,tidy.opts=list(width.cutoff=80), tidy=FALSE) 
+```
+
+#Libraries
+```{r libs, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(here) #For generalized file paths
+
+project_dir <- here()
+
+data_dir    <- here("data")
+sensor_dir  <- here("data", "sensor")
+snis_dir    <- here("data", "snis")
+survey_dir  <- here("data", "survey")
+spatial_dir <- here("data", "spatial")
+
+output_dir  <- here("output")
+temp_dir    <- here("output", "temp")
+
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(lubridate)
+library(patchwork)
+library(readxl)
+
+library(fixest)
+library(lfe)
+library(broom)
+library(lmtest)
+library(clubSandwich)
+library(modelsummary)
+
+library(SuperLearner)
+library(ltmle)
+library(cobalt)
+```
+
+## READ IN DATA
+```{r readdata, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ------------------ Read in SNIS data------------------
+analyticaldataset <- file.path(
+  snis_dir,
+  "snis_analytical_FINAL.rds"
+)
+
+if (!file.exists(analyticaldataset)) {
+  message("SNIS analytical dataset not found. See README for access instructions.")
+  knitr::knit_exit()
+}
+
+snis_analytical <- readRDS(analyticaldataset)
+
+# ------------------ Read in spatial data-----------------
+spatial_covariates_path <- file.path(
+  spatial_dir,
+  "health_zone_spatial_covariates.csv"
+)
+
+if (!file.exists(spatial_covariates_path)) {
+  message("Spatial covariates file not found. See README for access instructions.")
+  knitr::knit_exit()
+}
+
+spatial_covariates <- read.csv(spatial_covariates_path)
+
+snis_filtered <- snis_analytical %>%
+  filter(!is.na(A5_province), !is.na(A6_zone))
+
+snis_filtered <- snis_filtered %>%
+  mutate(A6_zone = recode_factor(A6_zone,
+    "Ruashi"       = "Rwashi",
+    "Haut Plateau" = "Hauts-Plateaux",
+    "Miti Murhesa" = "Miti-Murhesa",
+    "Kimbe Lulenge"= "Kimbi Lulenge"
+  ))
+
+# ------------------ Merge with spatial covariates ------------------
+# Match Nom <-> A6_zone and PROVINCE <-> A5_province
+snis_merged <- snis_filtered %>%
+  left_join(spatial_covariates, 
+            by = c("A6_zone" = "Nom"))
+
+# ------------------ Check for missing spatial data ------------------
+# Count how many rows did NOT get matched
+missing_count <- sum(is.na(snis_merged$wealth_mean))
+total_rows <- nrow(snis_merged)
+
+cat("Number of unmatched rows (missing spatial covariates):", missing_count, "\n")
+cat("Total rows after merge:", total_rows, "\n")
+cat("Percent unmatched:", round(100 * missing_count / total_rows, 2), "%\n")
+
+#Replace missing spatial values
+snis_merged <- snis_merged %>%
+  group_by(A5_province) %>%
+  mutate(wealth_mean = ifelse(is.na(wealth_mean), median(wealth_mean, na.rm = TRUE), wealth_mean)) %>%
+  mutate(pop_density_mean = ifelse(is.na(pop_density_mean), median(pop_density_mean, na.rm = TRUE), pop_density_mean)) %>%
+  mutate(dist_paved_km_mean = ifelse(is.na(dist_paved_km), median(dist_paved_km, na.rm = TRUE), dist_paved_km)) %>%
+  ungroup()
+
+snis_merged <- snis_merged %>%
+  mutate(
+    pop_density_raw = pop_density_mean,
+    pop_density_mean = log1p(pop_density_mean),
+    dist_paved_km_mean = log1p(dist_paved_km_mean)
+  )
+
+```
+
+## TMLE PREP - Shifting treatment to start based on survey install date
+```{r shiftedtreatment, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ------------------------
+# Step 1: Prepare  dataset
+# ------------------------
+snis_filtered <- snis_merged %>%
+  filter(facilitytype != "PH") %>%         # drop PH
+  filter(facilitytype != "H") %>%          # drop H
+  filter(tmle_shifted==1) %>%
+  mutate(
+    month_date_full = my(month),           # convert YYYY-MM to date
+    month_only = month(month_date_full, label = TRUE, abbr = FALSE)
+  ) %>%
+  group_by(id, month_date) %>%
+  filter(n() == 1) %>%                     # keep unique facility-month
+  ungroup()
+
+# ---------------------------
+# Step 2: Define treatment start date per facility
+# ---------------------------
+snis_filtered <- snis_filtered %>%
+  mutate(suff_reliable = as.integer(sufficient == 1 & uptime > 0.917))
+
+snis_filtered <- snis_filtered %>%
+  mutate(
+    treat_date = case_when(
+      suff_reliable == 1 & grid == 1 & !is.na(B2_grid_date) ~ B2_grid_date,
+      suff_reliable == 1 & grid == 0 & solar == 1 & !is.na(D2_solar_date) ~ D2_solar_date,
+      suff_reliable == 1 & grid == 0 & solar == 0 & generator == 1 & !is.na(C3_1_gen_date) ~ C3_1_gen_date,
+      TRUE ~ as.Date(NA)
+    )
+  )
+
+# ---------------------------
+# Step 3: Create dynamic suff_reliable
+# ---------------------------
+ltmle_data <- snis_filtered %>%
+  mutate(
+    suff_reliable = case_when(
+      !is.na(treat_date) & month_date_full >= treat_date ~ 1L,
+      TRUE ~ 0L
+    )
+  ) %>%
+  arrange(id, month_date) %>%
+  group_by(id) %>%
+  mutate(time = dense_rank(month_date)) %>%   # sequential time index per facility
+  ungroup() %>%
+  select(id, suff_reliable, time, mortrate_active,
+         uptime, uptime2, uptime3, facilitytype, month_only,
+         province, outpatientcount, wealth_mean, pop_density_mean,
+         dist_paved_km_mean, theft, treat_date, bedcount, mean_events, mean_fatalities)
+
+
+# ---------------------------
+# Step 4: Remove all-zero mortality facilities
+# ---------------------------
+zero_mort_ids <- ltmle_data %>%
+  group_by(id) %>%
+  summarise(all_zero = all(mortrate_active == 0, na.rm = TRUE)) %>%
+  filter(all_zero) %>%
+  pull(id)
+
+ltmle_data <- ltmle_data %>%
+  filter(!id %in% zero_mort_ids)
+
+# ---------------------------
+# Step 5: Reshape to wide format
+# ---------------------------
+# Outcomes
+Y_wide <- ltmle_data %>%
+  select(id, time, mortrate_active, suff_reliable) %>%
+  pivot_wider(names_from = time, values_from = mortrate_active,
+              names_prefix = "Y_")
+
+# Month covariate
+month_wide <- ltmle_data %>%
+  select(id, time, month_only) %>%
+  mutate(month_only = factor(month_only, levels = month.name)) %>%
+  pivot_wider(names_from = time, values_from = month_only,
+              names_prefix = "L_month_")
+
+# Outpatient covariate
+outpatient_wide <- ltmle_data %>%
+  select(id, time, outpatientcount) %>%
+  pivot_wider(names_from = time, values_from = outpatientcount,
+              names_prefix = "L_outpatient_")
+
+# Baseline controls
+controls <- ltmle_data %>%
+  filter(time == 1) %>%
+  select(id, facilitytype, province, theft, bedcount,
+         wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities)
+
+# ---------------------------
+# Step 6: Merge everything
+# ---------------------------
+ltmle_wide <- Y_wide %>%
+  left_join(month_wide, by = "id") %>%
+  left_join(outpatient_wide, by = "id") %>%
+  left_join(controls, by = "id")
+
+# ---------------------------
+# Step 7: Define node sets
+# ---------------------------
+Ynodes <- grep("^Y_", names(ltmle_wide), value = TRUE)
+L_month_nodes <- grep("^L_month_", names(ltmle_wide), value = TRUE)
+L_outpatient_nodes <- grep("^L_outpatient_", names(ltmle_wide), value = TRUE)
+
+# ---------------------------
+# Step 8: Prep ltmle-ready dataset
+# ---------------------------
+ltmle_ready <- ltmle_wide %>%
+  mutate(
+    suff_reliable = as.numeric(suff_reliable),
+    across(all_of(Ynodes), as.numeric),
+    across(all_of(L_month_nodes), ~ factor(., levels = month.name)),
+    facilitytype = as.factor(facilitytype),
+    province = as.factor(province),
+    theft = as.factor(theft),
+    wealth_mean = as.numeric(wealth_mean),
+    pop_density_mean = as.numeric(pop_density_mean),
+    dist_paved_km_mean = as.numeric(dist_paved_km_mean),
+    mean_events = as.numeric(mean_events),
+    mean_fatalities = as.numeric(mean_fatalities)
+  ) %>%
+  filter(!is.na(suff_reliable)) %>%
+  filter(!is.na(bedcount)) %>%
+  filter(!is.na(facilitytype), !is.na(province)) %>%
+  filter(if_all(all_of(L_outpatient_nodes), ~ !is.na(.))) %>%
+  filter(if_all(all_of(Ynodes), ~ !is.na(.))) %>%
+  filter(if_any(all_of(L_month_nodes), ~ !is.na(.))) %>%
+  select(id, facilitytype, province, theft, bedcount,
+         wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities,
+         suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes),
+         all_of(Ynodes))
+
+ltmle_ready <- ltmle_ready %>%
+  select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities, suff_reliable,  all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))
+
+# ---------------------------
+# Step 9: Run TMLE
+# ---------------------------
+gform <- c(suff_reliable = "suff_reliable ~ id + province + facilitytype + theft + bedcount + wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities")
+
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed); SL.xgboost(...)
+}
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed); SL.randomForest(...)
+}
+
+mortrate_shifted_2 <- ltmle(
+  data = ltmle_ready,
+  Anodes = "suff_reliable",
+  Lnodes = c(L_month_nodes, L_outpatient_nodes),
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart",
+                 "SL.xgboost.custom", "SL.randomForest.custom"),
+  gform = gform
+)
+
+# ---------------------------
+# Step 10: Summarize results
+# ---------------------------
+summary(mortrate_shifted_2)
+
+
+post_2021_facilities <- snis_filtered %>%
+  filter(!is.na(treat_date)) %>%
+  group_by(id) %>%
+  summarise(first_treat = min(treat_date, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(after_jan2021 = first_treat > ymd("2021-01-31"))
+sum(post_2021_facilities$after_jan2021)
+
+```
+
+## TMLE RUNS (Main specification) - Main Results Table 2
+```{r mortrate_suff_reli_917, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+###### Mortality rate, suff + reliable (91.7% uptime3) ######
+
+snis_filtered <- snis_merged %>%
+  filter(facilitytype != "PH") %>%
+  filter(facilitytype != "H") %>%
+  filter(tmle_list==1) %>%
+  mutate(
+    month_date_full = my(month),  
+    month_only = month(month_date_full, label = TRUE, abbr = FALSE)
+  ) %>%
+  group_by(id, month_date) %>%
+  filter(n() == 1) %>%
+  ungroup()
+
+
+# Step 2: Create suff_reliable and time index
+ltmle_data <- snis_filtered %>%
+  mutate(suff_reliable = as.integer(sufficient == 1 & uptime > 0.917)) %>%
+  arrange(id, month_date) %>%
+  group_by(id) %>%
+  mutate(time = dense_rank(month_date)) %>%
+  ungroup() %>%
+  select(id, suff_reliable, time, mortrate_active, uptime, uptime2, uptime3, facilitytype, month_only, province, outpatientcount, wealth_mean, pop_density_mean, dist_paved_km_mean, theft, inpatientcount_active, surgicaldeaths, mortrate_surgical, obgyndeaths, mortrate_obgyn, pedsdeaths, mortrate_peds, internalmeddeaths, mortrate_internalmed, nurse_A2_attendrate, doctor_attendrate, surgical_count, obgyn_count, peds_count, internalmed_count, nurse_A1, nurse_A2, doctor, labtech, bedcount, mean_events, mean_fatalities)
+
+snis_filtered %>%
+  filter(is.na(uptime)) %>%
+  distinct(id) %>%
+  nrow()
+
+
+# Step 3: Remove facilities with all-zero mortality
+zero_mort_ids <- ltmle_data %>%
+  group_by(id) %>%
+  summarise(all_zero = all(mortrate_active == 0, na.rm = TRUE)) %>%
+  filter(all_zero) %>%
+  pull(id)
+
+ltmle_data <- ltmle_data %>%
+  filter(!id %in% zero_mort_ids)
+
+# Step 4a: Reshape outcomes to wide format
+Y_wide <- ltmle_data %>%
+  select(id, time, mortrate_active, suff_reliable) %>%  
+  pivot_wider(
+    names_from = time,
+    values_from = mortrate_active,
+    names_prefix = "Y_"
+  )
+
+# Step 4b: Reshape month_only to wide format (MATCHING timepoints)
+month_wide <- ltmle_data %>%
+  select(id, time, month_only) %>%
+  mutate(month_only = factor(month_only, levels = month.name)) %>%
+  pivot_wider(
+    names_from = time,
+    values_from = month_only,
+    names_prefix = "L_month_"
+  )
+
+outpatient_wide <- ltmle_data %>%
+  select(id, time, outpatientcount) %>%
+  pivot_wider(
+    names_from = time,
+    values_from = outpatientcount,
+    names_prefix = "L_outpatient_"
+  )
+
+controls <- ltmle_data %>%
+  filter(time == 1) %>%
+  select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities)
+
+# Step 5: Combine wide-format datasets
+ltmle_wide <- Y_wide %>%
+  left_join(month_wide, by = "id") %>%
+  left_join(outpatient_wide, by = "id") %>%
+  left_join(controls, by = "id")
+
+# Step 6: Define node names
+Ynodes <- grep("^Y_", names(ltmle_wide), value = TRUE)
+L_month_nodes <- grep("^L_month_", names(ltmle_wide), value = TRUE)
+L_outpatient_nodes <- grep("^L_outpatient_", names(ltmle_wide), value = TRUE)
+
+# Step 7: Prepare ltmle_ready dataset
+ltmle_ready <- ltmle_wide %>%
+  mutate(
+    suff_reliable = as.numeric(suff_reliable),
+    across(all_of(Ynodes), as.numeric),
+    across(all_of(L_month_nodes), ~ factor(., levels = month.name)),
+    facilitytype = as.factor(facilitytype),
+    province = as.factor(province),
+    theft = as.factor(theft),
+    wealth_mean = as.numeric(wealth_mean),
+    pop_density_mean = as.numeric(pop_density_mean),
+    dist_paved_km_mean = as.numeric(dist_paved_km_mean),
+    mean_events = as.numeric(mean_events),
+    mean_fatalities = as.numeric(mean_fatalities)
+  ) %>%
+  filter(!is.na(suff_reliable)) %>%
+    filter(!is.na(bedcount)) %>%
+  filter(!is.na(facilitytype)) %>%
+  filter(!is.na(province)) %>%
+  filter(if_all(all_of(L_outpatient_nodes), ~ !is.na(.))) %>%
+  filter(if_all(all_of(Ynodes), ~ !is.na(.))) %>%
+  filter(if_any(all_of(L_month_nodes), ~ !is.na(.)))    
+
+# Step 8: Reorder so Lnodes come before Ynodes
+ltmle_ready <- ltmle_ready %>%
+  select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities, suff_reliable,  all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))
+
+gform <- c(suff_reliable = "suff_reliable ~ id + province + facilitytype + theft + bedcount + wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities")
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+# Step 9: Run TMLE
+mortrate_suff_reli_917 <- ltmle(
+  data = ltmle_ready,
+  Anodes = "suff_reliable",
+  Lnodes = c(L_month_nodes, L_outpatient_nodes),  
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform
+  )
+
+summary(mortrate_suff_reli_917)
+
+mortrate_suff_simplelearners <- ltmle(
+data = ltmle_ready,
+ Anodes = "suff_reliable",
+ Lnodes = c(L_month_nodes, L_outpatient_nodes),  
+ Ynodes = Ynodes,
+   abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean"),
+  gform = gform
+   )
+
+summary(mortrate_suff_simplelearners)
+
+```
+
+## DESCRIPTIVE STATISTICS - Main Results Table 1
+```{r dstats, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+ltmleready_ids <- ltmle_ready %>%
+    select(id)
+
+ids_to_keep_summary <- ltmleready_ids$id
+
+ltmle_summarystats <- ltmle_data %>%
+  filter(id %in% ids_to_keep_summary) 
+
+ltmle_summary_prov <- ltmle_summarystats %>%
+  group_by(province) %>%   
+  summarise(
+    n_obs = n(),
+    n_ids = n_distinct(id)
+  )
+
+ltmle_summary <- ltmle_summarystats %>%
+  group_by(facilitytype, suff_reliable) %>%   
+  summarise(
+    n_obs = n(),
+    n_ids = n_distinct(id),   
+    across(
+      c(mortrate_active, uptime, uptime2, uptime3, theft, bedcount,
+        wealth_mean, pop_density_mean, dist_paved_km_mean, outpatientcount, inpatientcount_active, surgical_count, surgicaldeaths, mortrate_surgical, obgyn_count, obgyndeaths, mortrate_obgyn, peds_count, pedsdeaths, mortrate_peds, internalmed_count, internalmeddeaths, mortrate_internalmed, nurse_A2_attendrate, doctor_attendrate, nurse_A1, nurse_A2, doctor, labtech, mean_events, mean_fatalities),
+      list(
+        mean = ~ mean(as.numeric(.), na.rm = TRUE),  # coerce numeric to avoid NA issues
+        sd   = ~ sd(as.numeric(.), na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+# Overall summary (drop suff_reliable distinction here, just aggregate full sample)
+overall_summary <- ltmle_summarystats %>%
+  summarise(
+    facilitytype = "Overall",
+    suff_reliable = NA_integer_,   # same type as your data
+    n_obs = n(),
+    n_ids = n_distinct(id),  
+    across(
+      c(mortrate_active, uptime, uptime2, uptime3, theft, bedcount,
+        wealth_mean, pop_density_mean, dist_paved_km_mean, outpatientcount, inpatientcount_active, surgical_count, surgicaldeaths, mortrate_surgical, obgyn_count, obgyndeaths, mortrate_obgyn, peds_count, pedsdeaths, mortrate_peds, internalmed_count, internalmeddeaths, mortrate_internalmed, nurse_A2_attendrate, doctor_attendrate, nurse_A1, nurse_A2, doctor, labtech, mean_events, mean_fatalities),
+      list(
+        mean = ~ mean(as.numeric(.), na.rm = TRUE),
+        sd   = ~ sd(as.numeric(.), na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+
+# Combine by-facilitytype/suff_reliable and overall into one table
+final_summary <- bind_rows(ltmle_summary, overall_summary)
+
+write.csv(final_summary, "final_summary.csv", row.names = FALSE)
+
+```
+
+## TMLE RUNS (Stepwise addition of covariates_ - Supplementary Materials Table S2)
+```{r pathwaystesting, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+## No Q vars
+ltmle_min <- ltmle_ready %>%
+  select(id, suff_reliable, all_of(Ynodes))   
+
+# Sparse gform and Qform
+gform_sparse <- c(suff_reliable = "suff_reliable ~ id")
+Qform_sparse <- setNames(rep("Q.kplus1 ~ suff_reliable", length(Ynodes)), Ynodes)
+
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+mortrate_sparseQ <- ltmle(
+  data = ltmle_min,
+  Anodes = "suff_reliable",
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform_sparse,
+  Qform = Qform_sparse
+)
+
+summary(mortrate_sparseQ)
+
+
+## Facility type
+ltmle_type <- ltmle_ready %>%
+  select(id, facilitytype, suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))   
+
+gform <- c(suff_reliable = "suff_reliable ~ id + facilitytype")
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+mortrate_type <- ltmle(
+  data = ltmle_type,
+  Anodes = "suff_reliable",
+  Lnodes = c(L_month_nodes, L_outpatient_nodes),  
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform
+  )
+
+summary(mortrate_type)
+
+
+## Area vars
+ltmle_area <- ltmle_ready %>%
+  select(id, province, facilitytype, theft, suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))   
+
+gform <- c(suff_reliable = "suff_reliable ~ id + province + facilitytype + theft")
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+mortrate_area <- ltmle(
+  data = ltmle_area,
+  Anodes = "suff_reliable",
+  Lnodes = c(L_month_nodes, L_outpatient_nodes),  
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform
+  )
+
+summary(mortrate_area)
+
+
+## All spatial vars
+ltmle_spatial <- ltmle_ready %>%
+  select(id, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities, suff_reliable, all_of(Ynodes))   
+
+gform <- c(suff_reliable = "suff_reliable ~ id + wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities")
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+mortrate_spatial <- ltmle(
+  data = ltmle_spatial,
+  Anodes = "suff_reliable",
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform
+  )
+
+summary(mortrate_spatial)
+
+##No g vars - variable
+ltmle_noG <- ltmle_ready %>%
+  select(id, suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))   
+
+gform <- c(suff_reliable = "suff_reliable ~ 1")
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+# Step 9: Run TMLE
+mortrate_id_only <- ltmle(
+  data = ltmle_noG,
+  Anodes = "suff_reliable",
+  Lnodes = c(L_month_nodes, L_outpatient_nodes),  
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform
+  )
+
+summary(mortrate_id_only)
+
+## Full
+ltmle_full <- ltmle_ready %>%
+  select(id, province, facilitytype, theft, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities, suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))   
+
+gform <- c(suff_reliable = "suff_reliable ~ id +  province + facilitytype + theft + wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities")
+set.seed(8675309)
+
+SL.xgboost.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.xgboost(...)
+}
+
+SL.randomForest.custom <- function(..., seed = 8675309) {
+  set.seed(seed)
+  SL.randomForest(...)
+}
+
+mortrate_full <- ltmle(
+  data = ltmle_full,
+  Anodes = "suff_reliable",
+  Lnodes = c(L_month_nodes, L_outpatient_nodes),  
+  Ynodes = Ynodes,
+  abar = list(treated = 1, untreated = 0),
+  SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart", "SL.xgboost.custom", "SL.randomForest.custom"), 
+  gform = gform
+  )
+
+summary(mortrate_full)
+
+```
+
+## TMLE RUNS (All specifications) - Main Results Table 2
+```{r altspecifications, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ---------------------------
+# Treatment definitions
+# ---------------------------
+treatment_defs <- list(
+  suff_uptime_917 = quote(as.integer(sufficient == 1 & uptime > 0.917)),
+  suff_uptime2_917  = quote(as.integer(sufficient == 1 & uptime2 > 0.917)),
+  suff_uptime3_917 = quote(as.integer(sufficient == 1 & uptime3 > 0.917)),
+  uptime_only_917 = quote(as.integer(uptime > 0.917)),
+  uptime3_only_917 = quote(as.integer(uptime3 > 0.917)),
+  suff_only        = quote(as.integer(sufficient == 1)),  
+  suff_uptime3_85  = quote(as.integer(sufficient == 1 & uptime3 > 0.85)),
+  suff_uptime3_86  = quote(as.integer(sufficient == 1 & uptime3 > 0.86)),
+  suff_uptime3_87  = quote(as.integer(sufficient == 1 & uptime3 > 0.87)),
+  suff_uptime3_88  = quote(as.integer(sufficient == 1 & uptime3 > 0.88)),
+  suff_uptime3_89  = quote(as.integer(sufficient == 1 & uptime3 > 0.89)),
+  suff_uptime3_90  = quote(as.integer(sufficient == 1 & uptime3 > 0.90)),
+  suff_uptime3_91  = quote(as.integer(sufficient == 1 & uptime3 > 0.91)),
+  suff_uptime3_92  = quote(as.integer(sufficient == 1 & uptime3 > 0.92)),
+  suff_uptime3_93  = quote(as.integer(sufficient == 1 & uptime3 > 0.93)),
+  suff_uptime3_94  = quote(as.integer(sufficient == 1 & uptime3 > 0.94)),
+  suff_uptime3_95  = quote(as.integer(sufficient == 1 & uptime3 > 0.95)),
+    suff_uptime_85  = quote(as.integer(sufficient == 1 & uptime > 0.85)),
+  suff_uptime_86  = quote(as.integer(sufficient == 1 & uptime > 0.86)),
+  suff_uptime_87  = quote(as.integer(sufficient == 1 & uptime > 0.87)),
+  suff_uptime_88  = quote(as.integer(sufficient == 1 & uptime > 0.88)),
+  suff_uptime_89  = quote(as.integer(sufficient == 1 & uptime > 0.89)),
+  suff_uptime_90  = quote(as.integer(sufficient == 1 & uptime > 0.90)),
+  suff_uptime_91  = quote(as.integer(sufficient == 1 & uptime > 0.91)),
+  suff_uptime_92  = quote(as.integer(sufficient == 1 & uptime > 0.92)),
+  suff_uptime_93  = quote(as.integer(sufficient == 1 & uptime > 0.93)),
+  suff_uptime_94  = quote(as.integer(sufficient == 1 & uptime > 0.94)),
+  suff_uptime_95  = quote(as.integer(sufficient == 1 & uptime > 0.95)),
+    suff_uptime2_85  = quote(as.integer(sufficient == 1 & uptime2 > 0.85)),
+  suff_uptime2_86  = quote(as.integer(sufficient == 1 & uptime2 > 0.86)),
+  suff_uptime2_87  = quote(as.integer(sufficient == 1 & uptime2 > 0.87)),
+  suff_uptime2_88  = quote(as.integer(sufficient == 1 & uptime2 > 0.88)),
+  suff_uptime2_89  = quote(as.integer(sufficient == 1 & uptime2 > 0.89)),
+  suff_uptime2_90  = quote(as.integer(sufficient == 1 & uptime2 > 0.90)),
+  suff_uptime2_91  = quote(as.integer(sufficient == 1 & uptime2 > 0.91)),
+  suff_uptime2_92  = quote(as.integer(sufficient == 1 & uptime2 > 0.92)),
+  suff_uptime2_93  = quote(as.integer(sufficient == 1 & uptime2 > 0.93)),
+  suff_uptime2_94  = quote(as.integer(sufficient == 1 & uptime2 > 0.94)),
+  suff_uptime2_95  = quote(as.integer(sufficient == 1 & uptime2 > 0.95))
+)
+
+# ---------------------------
+# Initialize storage
+# ---------------------------
+tmle_results_list <- list()
+tmle_fits <- list()
+
+# ---------------------------
+# Loop through treatment definitions
+# ---------------------------
+for (nm in names(treatment_defs)) {
+  message("Running model: ", nm)
+
+  # Prep
+  snis_filtered <- snis_merged %>%
+    filter(!facilitytype %in% c("PH", "H")) %>%
+    filter(tmle_list==1) %>%
+    mutate(
+      month_date_full = my(month),
+      month_only = month(month_date_full, label = TRUE, abbr = FALSE)
+    ) %>%
+    group_by(id, month_date) %>%
+    filter(n() == 1) %>%
+    ungroup()
+
+  ltmle_data <- snis_filtered %>%
+    mutate(suff_reliable = eval(treatment_defs[[nm]])) %>%
+    arrange(id, month_date) %>%
+    group_by(id) %>%
+    mutate(time = dense_rank(month_date)) %>%
+    ungroup() %>%
+    select(id, suff_reliable, time, mortrate_active,
+           sufficient, uptime, uptime2, uptime3,
+           facilitytype, month_only, province, theft, bedcount, outpatientcount,
+           wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities, ols_list)
+
+  zero_mort_ids <- ltmle_data %>%
+    group_by(id) %>%
+    summarise(all_zero = all(mortrate_active == 0, na.rm = TRUE)) %>%
+    filter(all_zero) %>%
+    pull(id)
+
+  ltmle_data <- ltmle_data %>% filter(!id %in% zero_mort_ids)
+
+  # Wide reshape
+  Y_wide <- ltmle_data %>%
+    select(id, time, mortrate_active, suff_reliable) %>%
+    pivot_wider(names_from = time, values_from = mortrate_active, names_prefix = "Y_")
+
+  month_wide <- ltmle_data %>%
+    select(id, time, month_only) %>%
+    mutate(month_only = factor(month_only, levels = month.name)) %>%
+    pivot_wider(names_from = time, values_from = month_only, names_prefix = "L_month_")
+
+  outpatient_wide <- ltmle_data %>%
+    select(id, time, outpatientcount) %>%
+    pivot_wider(names_from = time, values_from = outpatientcount, names_prefix = "L_outpatient_")
+
+  controls <- ltmle_data %>%
+    filter(time == 1) %>%
+    select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities)
+
+  ltmle_wide <- Y_wide %>%
+    left_join(month_wide, by = "id") %>%
+    left_join(outpatient_wide, by = "id") %>%
+    left_join(controls, by = "id")
+
+  # Nodes
+  Ynodes <- grep("^Y_", names(ltmle_wide), value = TRUE)
+  L_month_nodes <- grep("^L_month_", names(ltmle_wide), value = TRUE)
+  L_outpatient_nodes <- grep("^L_outpatient_", names(ltmle_wide), value = TRUE)
+
+  # Final prep
+  ltmle_ready <- ltmle_wide %>%
+    mutate(
+      suff_reliable = as.numeric(suff_reliable),
+      across(all_of(Ynodes), as.numeric),
+      across(all_of(L_month_nodes), ~ factor(., levels = month.name)),
+      facilitytype = as.factor(facilitytype),
+      province = as.factor(province),
+      theft = as.factor(theft),
+      wealth_mean = as.numeric(wealth_mean),
+      pop_density_mean = as.numeric(pop_density_mean),
+      dist_paved_km_mean = as.numeric(dist_paved_km_mean),
+      mean_events = as.numeric(mean_events),
+      mean_fatalities = as.numeric(mean_fatalities)
+   ) %>%
+    filter(!is.na(suff_reliable)) %>%
+    filter(!is.na(bedcount)) %>%
+    filter(!is.na(facilitytype), !is.na(province)) %>%
+    filter(if_all(all_of(L_outpatient_nodes), ~ !is.na(.))) %>%
+    filter(if_all(all_of(Ynodes), ~ !is.na(.))) %>%
+    filter(if_any(all_of(L_month_nodes), ~ !is.na(.))) %>%
+    select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, mean_events, mean_fatalities,
+           suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))
+  
+  # Run TMLE
+  gform <- c(suff_reliable = "suff_reliable ~ id + province + facilitytype + theft + bedcount+ wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities")
+  set.seed(8675309)
+  tmle_result <- ltmle(
+    data = ltmle_ready,
+    Anodes = "suff_reliable",
+    Lnodes = c(L_month_nodes, L_outpatient_nodes),
+    Ynodes = Ynodes,
+    abar = list(treated = 1, untreated = 0),
+    SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart",
+                   "SL.xgboost.custom", "SL.randomForest.custom"),
+    gform = gform
+  )
+
+  tmle_sum <- summary(tmle_result)
+
+  # Save both fit & summary
+  tmle_fits[[nm]] <- tmle_result
+  tmle_results_list[[nm]] <- data.frame(
+    treatment = nm,
+    ate = tmle_sum$effect.measures$ATE$estimate,
+    se = tmle_sum$effect.measures$ATE$std.dev,
+    ci_low = tmle_sum$effect.measures$ATE$CI[1],
+    ci_high = tmle_sum$effect.measures$ATE$CI[2],
+    pval = tmle_sum$effect.measures$ATE$pvalue,
+    control_mean = tmle_sum$effect.measures$control$estimate,
+    treated_mean = tmle_sum$effect.measures$treatment$estimate,
+    treated = sum(ltmle_ready$suff_reliable == 1, na.rm = TRUE),
+    control = sum(ltmle_ready$suff_reliable == 0, na.rm = TRUE)
+  )
+}
+
+# Combine results
+tmle_results_df <- bind_rows(tmle_results_list, .id = "model_name")
+
+# Also append simple-learners run
+s <- summary(mortrate_suff_simplelearners)
+tmle_fits[["suff_simplelearners"]] <- mortrate_suff_simplelearners
+tmle_results_df <- bind_rows(
+  tmle_results_df,
+  data.frame(
+    model_name = "suff_simplelearners",
+    treatment = "suff_simplelearners",
+    ate = s$effect.measures$ATE$estimate,
+    se = s$effect.measures$ATE$std.dev,
+    ci_low = s$effect.measures$ATE$CI[1],
+    ci_high = s$effect.measures$ATE$CI[2],
+    pval = s$effect.measures$ATE$pvalue,
+      control_mean = s$effect.measures$control$estimate,
+    treated_mean = s$effect.measures$treatment$estimate,
+    treated = sum(mortrate_suff_simplelearners$inputs$data$suff_reliable == 1, na.rm = TRUE),
+    control = sum(mortrate_suff_simplelearners$inputs$data$suff_reliable == 0, na.rm = TRUE)
+  )
+)
+
+t <- summary(mortrate_shifted_2)
+tmle_fits[["mortrate_shifted_2"]] <- mortrate_shifted_2
+tmle_results_df <- bind_rows(
+  tmle_results_df,
+  data.frame(
+    model_name = "mortrate_shifted_2",
+    treatment = "mortrate_shifted_2",
+    ate = t$effect.measures$ATE$estimate,
+    se = t$effect.measures$ATE$std.dev,
+    ci_low = t$effect.measures$ATE$CI[1],
+    ci_high = t$effect.measures$ATE$CI[2],
+    pval = t$effect.measures$ATE$pvalue,
+      control_mean = t$effect.measures$control$estimate,
+    treated_mean = t$effect.measures$treatment$estimate,
+    treated = sum(mortrate_shifted_2$inputs$data$suff_reliable == 1, na.rm = TRUE),
+    control = sum(mortrate_shifted_2$inputs$data$suff_reliable == 0, na.rm = TRUE)
+  )
+)
+
+
+```
+
+## TMLE RUNS (Plots) - Figure 2, Figure 3, and Figure S3
+```{r resultsplots, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+altspecifications_models <- c("suff_uptime_917", "suff_simplelearners", "mortrate_shifted_2", "suff_uptime2_917", "suff_uptime3_917", "suff_only", "uptime3_only_917")
+
+# Map nicer labels
+label_map_alt <- c(
+  suff_uptime_917   = "Suff + 91.7% uptime (v1)",
+  suff_simplelearners = "Suff + 91.7% uptime (simple SL)",
+  mortrate_shifted_2 = "Suff + 91.7% uptime (drop late treated)",
+  suff_uptime2_917    = "Suff + 91.7% uptime (v2)",
+  suff_uptime3_917   = "Suff + 91.7% uptime (v3)",
+  suff_only          = "Sufficient only",
+  uptime3_only_917   = "91.7% uptime only (v1)"
+)
+
+# Subset results
+res_alt <- tmle_results_df %>%
+  filter(model_name %in% altspecifications_models) %>%
+  mutate(label = factor(label_map_alt[model_name],
+                        levels = rev(label_map_alt[altspecifications_models])))
+
+tmle_long_altspec <- res_alt %>%
+  select(label, ate, treated_mean, control_mean, ci_low, ci_high) %>%
+  pivot_longer(cols = c(ate, treated_mean, control_mean),
+               names_to = "point_type", values_to = "estimate") %>%
+  mutate(point_type = dplyr::recode(point_type,
+                             "ate" = "ATE",
+                             "treated_mean" = "Treated Mean",
+                             "control_mean" = "Control Mean"))
+
+# Reshape for plotting
+ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 0.8) +
+  geom_errorbarh(data = res_alt,
+                 aes(y = label, xmin = ci_low, xmax = ci_high),
+                 height = 0.25, color = "gray40") +
+  geom_point(data = tmle_long_altspec,
+             aes(x = estimate, y = label, color = point_type),
+             shape = 16, size = 3) +   # solid circles
+  scale_color_manual(values = c("ATE" = "black",
+                                "Treated Mean" = "#1A9850",
+                                "Control Mean" = "#D73027"),
+                     guide = guide_legend(title = NULL)) +  
+  labs(title = "Effect of Sufficient & Reliable Power \n on All-Cause Mortality Rate",
+       x = "Mortality Rate", y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.y = element_text(size = 12),
+        axis.text.x = element_text(size = 11),
+        legend.position = "bottom",
+        legend.title = element_blank())   
+
+
+
+##Shifting cutoff 
+cutoff_curve <- tmle_results_df %>%
+  filter(grepl("^suff_uptime_\\d{2}$", model_name)) %>%
+  mutate(cutoff_num = as.numeric(sub(".*_(\\d{2})$", "\\1", model_name)) / 100)
+
+# Top panel: ATE estimates with ribbon (purple theme)
+p1 <- ggplot(cutoff_curve, aes(x = cutoff_num, y = ate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.2, fill = "#542788") +
+  geom_line(color = "#542788", linewidth = 1.2) +
+  geom_point(color = "#542788", size = 2) +
+  scale_x_continuous(breaks = seq(0.85, 0.95, 0.01)) +
+  labs(
+    title = "Shifting Reliability Cutoff",
+    x = NULL,
+    y = "ATE"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Bottom panel: Treated vs Control counts
+share_df <- cutoff_curve %>%
+  mutate(
+    share_treated = treated / 303,
+    share_control = control / 303
+  ) %>%
+  tidyr::pivot_longer(cols = c(share_treated, share_control),
+                      names_to = "group", values_to = "share")
+
+p2 <- ggplot(share_df, aes(x = cutoff_num, y = share, fill = group)) +
+  geom_area(alpha = 0.5, position = "stack") +
+  scale_fill_manual(values = c("share_treated" = "#542788",
+                               "share_control" = "gray50"),
+                    labels = c("share_treated" = "Treated",
+                               "share_control" = "Control")) +
+  scale_x_continuous(breaks = seq(0.85, 0.95, 0.01)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = "Uptime Cutoff",
+    y = "Share of Facilities",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+# Combine vertically
+p1 / p2 + plot_layout(heights = c(2, 1))
+
+
+
+
+# Prepare data for all uptime definitions
+cutoff_curve_all <- tmle_results_df %>%
+  filter(grepl("^suff_uptime(2|3)?_\\d{2}$", model_name)) %>%
+  mutate(
+    cutoff_num = as.numeric(sub(".*_(\\d{2})$", "\\1", model_name)) / 100,
+    uptime_def = case_when(
+      grepl("^suff_uptime3_", model_name) ~ "Uptime v3",
+      grepl("^suff_uptime2_", model_name) ~ "Uptime v2",
+      grepl("^suff_uptime_",  model_name) ~ "Uptime v1"
+    ),
+    uptime_def = factor(uptime_def, levels = c("Uptime v1", "Uptime v2", "Uptime v3"))
+  )
+
+ggplot(cutoff_curve_all, aes(x = cutoff_num, y = ate, color = uptime_def, fill = uptime_def)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ uptime_def, ncol = 1, scales = "fixed") +
+  scale_color_manual(values = c(
+    "Uptime v1" = "#542788",   # teal
+    "Uptime v2" = "#D95F02",   # orange
+    "Uptime v3" = "#21908C"    # dark purple
+  )) +
+  scale_fill_manual(values = c(
+    "Uptime v1" = "#542788",
+    "Uptime v2" = "#D95F02",
+    "Uptime v3" = "#21908C"
+  )) +
+  scale_x_continuous(breaks = seq(0.85, 0.95, 0.01)) +
+  labs(
+    title = "Effect of Sufficient & Reliable Power Across Uptime Cutoffs",
+    x = "Uptime Cutoff",
+    y = "Average Treatment Effect (ATE)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+        legend.title = element_blank()
+  )
+
+```
+
+## OLS AND IPW ESTIMATES (Models and balance tests) - Supplementary Materials Table S2, Figure S1, Figure S2
+```{r OLS_IPW, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+## --- Data prep (panel) ---
+robust_data <- ltmle_data %>%
+  mutate(
+    A = as.integer(suff_reliable),
+    Y = mortrate_active,
+    province = as.factor(province),
+    facilitytype = as.factor(facilitytype),
+    month_only = factor(month_only, levels = month.name)
+  ) %>%
+  filter(!is.na(A), !is.na(Y)) %>%
+  filter(ols_list==1) 
+
+baseline_covars <- c("province", "facilitytype",
+                     "wealth_mean", "pop_density_mean", "dist_paved_km_mean", "theft", "bedcount", "mean_events", "mean_fatalities")
+timevarying_covars <- c("month_only", "outpatientcount")
+all_covars <- c(baseline_covars, timevarying_covars)
+
+## =================================
+## Naive difference
+## =================================
+naive <- robust_data %>%
+  summarise(
+    mean_T = mean(Y[A == 1], na.rm = TRUE),
+    mean_C = mean(Y[A == 0], na.rm = TRUE),
+    diff   = mean_T - mean_C,
+    perc   = 100 * (mean_T - mean_C) / mean_C
+  )
+
+
+
+## =================================
+## OLS & IPTW 
+## =================================
+set.seed(8675309)
+SL.lib <- c("SL.glm", "SL.mean", "SL.gam")
+
+ps_fit <- SuperLearner(
+  Y = robust_data$A,
+  X = robust_data[, all_covars],
+  family = binomial(),
+  SL.library = SL.lib,
+  method = "method.NNLS",
+  cvControl = list(V = 5)
+)
+
+robust_data$ps <- pmin(pmax(ps_fit$SL.predict, 0.1), 0.9)
+robust_data$w <- ifelse(robust_data$A == 1,
+                        1, robust_data$ps / (1 - robust_data$ps))
+
+iptw <- feols(Y ~ A ,
+              data = robust_data, weights = ~w)
+
+summary(robust_data$w)
+
+# Define sets of controls (additive)
+covs_list <- list(
+  "None" = "",
+  "Facility Type" = "facilitytype + bedcount",
+  "+ Area Vars" = "province + facilitytype + bedcount + theft",
+  "+ Spatial Vars" = "province + facilitytype + bedcount + theft +
+                          wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities",
+  "Variable"  = "month_only + outpatientcount",
+  "FULL"  = "province + facilitytype + bedcount + theft +
+                          wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities +
+                          month_only + outpatientcount"
+)
+
+
+robust_trimmed <- robust_data %>%
+  filter(ps > 0.05 & ps < 0.95)
+
+ols_models <- lapply(covs_list, function(covs) {
+  feols(as.formula(paste("Y ~ A", if (covs != "") paste("+", covs) else "")),
+        data = robust_trimmed)
+})
+
+ipw_models <- lapply(covs_list, function(covs) {
+  feols(as.formula(paste("Y ~ A", if (covs != "") paste("+", covs) else "")),
+        data = robust_trimmed, weights = ~w)
+})
+
+etable(
+  c(ipw_models),
+  digits = 3,
+  dict = c(
+    "A"                = "Suff + Reliable Power",
+    "provinceNk"               = "Province: North Kivu",
+    "provinceSouthKivu"               = "Province: South Kivu",
+    "facilitytypeCM"     = "Facility Type: CM",
+    "facilitytypeCSR"     = "Facility Type: CSR",
+    "facilitytypeHGR"     = "Facility Type: HGR",
+    "bedcount"         = "Bed count",
+    "theft"            = "Electricity Theft (0/1)",
+    "wealth_mean"      = "Wealth Index",
+    "pop_density_mean" = "Population Density",
+    "dist_paved_km_mean" = "Distance to paved road (km)",
+    "month_only.L"       = "Jan",
+    "month_only.Q"       = "Feb",
+    "month_only.C"       = "Mar",
+    "month_only^4"       = "Apr",
+    "month_only^5"       = "May",
+    "month_only^6"       = "Jun",
+    "month_only^7"       = "Jul",
+    "month_only^8"       = "Aug",
+    "month_only^9"       = "Sept",
+    "month_only^10"       = "Oct",
+    "month_only^11"       = "Nov",
+    "outpatientcount"  = "Montly Outpatient Count"
+  ),
+  fitstat = ~ n + ar2, 
+  style.tex = style.tex("aer")
+)
+
+
+etable(
+  c(ols_models),
+  digits = 3,
+  dict = c(
+    "A"                = "Suff + Reliable Power",
+    "provinceNk"               = "Province: North Kivu",
+    "provinceSouthKivu"               = "Province: South Kivu",
+    "facilitytypeCM"     = "Facility Type: CM",
+    "facilitytypeCSR"     = "Facility Type: CSR",
+    "facilitytypeHGR"     = "Facility Type: HGR",
+    "bedcount"         = "Bed count",
+    "theft"            = "Electricity Theft (0/1)",
+    "wealth_mean"      = "Wealth Index",
+    "pop_density_mean" = "Population Density",
+    "dist_paved_km_mean" = "Distance to paved road (km)",
+    "month_only.L"       = "Jan",
+    "month_only.Q"       = "Feb",
+    "month_only.C"       = "Mar",
+    "month_only^4"       = "Apr",
+    "month_only^5"       = "May",
+    "month_only^6"       = "Jun",
+    "month_only^7"       = "Jul",
+    "month_only^8"       = "Aug",
+    "month_only^9"       = "Sept",
+    "month_only^10"       = "Oct",
+    "month_only^11"       = "Nov",
+    "outpatientcount"  = "Montly Outpatient Count"
+  ),
+  fitstat = ~ n + ar2, 
+  style.tex = style.tex("aer")
+)
+
+
+mean_control <- mean(robust_trimmed$Y[robust_trimmed$A == 0], na.rm = TRUE)
+
+extract_estimates <- function(models, label) {
+  sapply(models, function(m) {
+    est <- coef(m)["A"]
+    pct <- (est / mean_control) * 100
+    return(c(est = est, pct = pct))
+  }) |>
+    t() |>
+    as.data.frame() |>
+    dplyr::mutate(Method = label)
+}
+
+ols_df <- extract_estimates(ols_models, "OLS")
+ipw_df <- extract_estimates(ipw_models, "IPW")
+
+
+## =================================
+## Weights diagnostics
+## =================================
+bal_tab <- bal.tab(
+  A ~ province + facilitytype + theft + bedcount + wealth_mean + pop_density_mean + dist_paved_km_mean + mean_events + mean_fatalities,
+  data = robust_data,
+  weights = robust_data$w,
+  method = "weighting",
+  un = TRUE,      # keep unadjusted
+  quick = FALSE   # compute full set
+)
+
+
+love.plot(
+  bal_tab,
+  thresholds = c(m = .1),
+  abs = TRUE,
+  var.order = "unadjusted",
+  sample.names = c("Unadjusted", "Weighted")
+)
+
+
+ggplot(robust_trimmed, aes(x = ps, fill = factor(A))) +
+  geom_density(alpha = 0.4) +
+  scale_fill_manual(values = c("0" = "gray", "1" = "blue"),
+                    name = "Treatment") +
+  labs(x = "Propensity score", y = "Density",
+       title = "Propensity Score Overlap: Treated vs. Control") +
+  theme_minimal()
+```
+
+## TMLE RUNS (Additional Outcomes, Part 1) - Main Results Table 3
+```{r otheroutcomes, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ---------------------------
+# Outcome definitions
+# ---------------------------
+outcomes <- c(
+  "mortrate_surgical",
+  "mortrate_obgyn",
+  "mortrate_peds",
+  "mortrate_internalmed",
+  "nurse_A1",
+  "nurse_A2",
+  "doctor",
+  "labtech"
+)
+
+# ---------------------------
+# Initialize storage
+# ---------------------------
+tmle_results_list_outcomes <- list()
+tmle_fits_outcomes <- list()
+
+# ---------------------------
+# Loop through outcomes
+# ---------------------------
+for (yvar in outcomes) {
+  message("Running model for outcome: ", yvar)
+
+  # Prep
+  snis_filtered <- snis_merged %>%
+    filter(!facilitytype %in% c("PH", "H")) %>%
+    filter(tmle_list==1) %>%
+    mutate(
+      month_date_full = my(month),
+      month_only = month(month_date_full, label = TRUE, abbr = FALSE),
+      suff_reliable = as.integer(sufficient == 1 & uptime > 0.917)  # fixed treatment
+    ) %>%
+    group_by(id, month_date) %>%
+    filter(n() == 1) %>%
+    ungroup()
+
+  ltmle_data <- snis_filtered %>%
+    arrange(id, month_date) %>%
+    group_by(id) %>%
+    mutate(time = dense_rank(month_date)) %>%
+    ungroup() %>%
+    select(id, suff_reliable, time, all_of(yvar),
+           sufficient, uptime, uptime2, uptime3,
+           facilitytype, month_only, province, theft, bedcount, outpatientcount,
+           wealth_mean, pop_density_mean, dist_paved_km_mean)
+
+  # Drop facilities with all-zero outcome
+  zero_ids <- ltmle_data %>%
+    group_by(id) %>%
+    summarise(all_zero = all(.data[[yvar]] == 0, na.rm = TRUE)) %>%
+    filter(all_zero) %>%
+    pull(id)
+
+  ltmle_data <- ltmle_data %>% filter(!id %in% zero_ids)
+
+  # Wide reshape
+  Y_wide <- ltmle_data %>%
+    select(id, time, suff_reliable, all_of(yvar)) %>%
+    pivot_wider(names_from = time, values_from = all_of(yvar), names_prefix = "Y_")
+
+  month_wide <- ltmle_data %>%
+    select(id, time, month_only) %>%
+    mutate(month_only = factor(month_only, levels = month.name)) %>%
+    pivot_wider(names_from = time, values_from = month_only, names_prefix = "L_month_")
+
+  outpatient_wide <- ltmle_data %>%
+    select(id, time, outpatientcount) %>%
+    pivot_wider(names_from = time, values_from = outpatientcount, names_prefix = "L_outpatient_")
+
+  controls <- ltmle_data %>%
+    filter(time == 1) %>%
+    select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean)
+
+  ltmle_wide <- Y_wide %>%
+    left_join(month_wide, by = "id") %>%
+    left_join(outpatient_wide, by = "id") %>%
+    left_join(controls, by = "id")
+
+  # Nodes
+  Ynodes <- grep("^Y_", names(ltmle_wide), value = TRUE)
+  L_month_nodes <- grep("^L_month_", names(ltmle_wide), value = TRUE)
+  L_outpatient_nodes <- grep("^L_outpatient_", names(ltmle_wide), value = TRUE)
+
+  # Final prep
+  ltmle_ready <- ltmle_wide %>%
+    mutate(
+      suff_reliable = as.numeric(suff_reliable),
+      across(all_of(Ynodes), as.numeric),
+      across(all_of(L_month_nodes), ~ factor(., levels = month.name)),
+      facilitytype = as.factor(facilitytype),
+      province = as.factor(province),
+      theft = as.factor(theft),
+      wealth_mean = as.numeric(wealth_mean),
+      pop_density_mean = as.numeric(pop_density_mean),
+      dist_paved_km_mean = as.numeric(dist_paved_km_mean)
+    ) %>%
+    filter(!is.na(suff_reliable)) %>%
+    filter(!is.na(bedcount)) %>%
+    filter(!is.na(facilitytype), !is.na(province)) %>%
+    filter(if_all(all_of(L_outpatient_nodes), ~ !is.na(.))) %>%
+    filter(if_all(all_of(Ynodes), ~ !is.na(.))) %>%
+    filter(if_any(all_of(L_month_nodes), ~ !is.na(.)))
+  
+  ltmle_ready_filtered <- ltmle_ready %>%
+    select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, suff_reliable, all_of(L_month_nodes), all_of(L_outpatient_nodes), all_of(Ynodes))
+
+  # Run TMLE
+  gform <- c(suff_reliable = "suff_reliable ~ id + province + facilitytype + theft + bedcount + wealth_mean + pop_density_mean + dist_paved_km_mean")
+  
+  set.seed(8675309)
+  
+  tmle_result_outcome <- ltmle(
+    data = ltmle_ready_filtered,
+    Anodes = "suff_reliable",
+    Lnodes = c(L_month_nodes, L_outpatient_nodes),
+    Ynodes = Ynodes,
+    abar = list(treated = 1, untreated = 0),
+    SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart",
+                   "SL.xgboost.custom", "SL.randomForest.custom"),
+    gform = gform
+  )
+
+  tmle_sum_outcome <- summary(tmle_result_outcome)
+
+  # Save
+  tmle_fits_outcomes[[yvar]] <- tmle_result_outcome
+  tmle_results_list_outcomes[[yvar]] <- data.frame(
+    outcome = yvar,
+    ate = tmle_sum_outcome$effect.measures$ATE$estimate,
+    se = tmle_sum_outcome$effect.measures$ATE$std.dev,
+    ci_low = tmle_sum_outcome$effect.measures$ATE$CI[1],
+    ci_high = tmle_sum_outcome$effect.measures$ATE$CI[2],
+    pval = tmle_sum_outcome$effect.measures$ATE$pvalue,
+    control_mean = tmle_sum_outcome$effect.measures$control$estimate,
+    treated_mean = tmle_sum_outcome$effect.measures$treatment$estimate,
+    treated = sum(ltmle_ready$suff_reliable == 1, na.rm = TRUE),
+    control = sum(ltmle_ready$suff_reliable == 0, na.rm = TRUE)
+  )
+}
+
+# Combine results for outcome models
+tmle_results_outcomes_df <- bind_rows(tmle_results_list_outcomes, .id = "model_name")
+
+tmle_results_outcomes_df <- tmle_results_outcomes_df %>%
+  mutate(
+    family = case_when(
+      outcome %in% c("mortrate_surgical", "mortrate_obgyn", 
+                     "mortrate_peds", "mortrate_internalmed") ~ "Mortality",
+      outcome %in% c("nurse_A1", "nurse_A2", "doctor", "labtech") ~ "Staffing",
+      outcome %in% c("outpatientcount", "admissions") ~ "Patient Volume",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  group_by(family) %>%
+  mutate(
+    pval_BH_group = p.adjust(pval, method = "BH")
+  ) %>%
+  ungroup() %>%
+  mutate(sig_BH_group = ifelse(pval_BH_group < 0.05, "*", ""))
+
+
+
+```
+
+## TMLE RUNS (Additional Outcomes, Part 2) - Main Results Table 3
+```{r otheroutcomes2, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# ---------------------------
+# Outcome definitions
+# ---------------------------
+ outcomes <- c(
+   "outpatientcount",
+   "inpatientcount_active"
+ )
+
+# ---------------------------
+# Initialize storage
+# ---------------------------
+tmle_results_list_outcomes2 <- list()
+tmle_fits_outcomes2 <- list()
+
+# ---------------------------
+# Loop through outcomes
+# ---------------------------
+for (yvar in outcomes) {
+  message("Running model for outcome: ", yvar)
+
+  # Prep
+  snis_filtered <- snis_merged %>%
+    filter(!facilitytype %in% c("PH", "H")) %>%
+    filter(tmle_list==1) %>%
+    mutate(
+      month_date_full = my(month),
+      month_only = month(month_date_full, label = TRUE, abbr = FALSE),
+      suff_reliable = as.integer(sufficient == 1 & uptime > 0.917)  # fixed treatment
+    ) %>%
+    group_by(id, month_date) %>%
+    filter(n() == 1) %>%
+    ungroup()
+
+  ltmle_data <- snis_filtered %>%
+    arrange(id, month_date) %>%
+    group_by(id) %>%
+    mutate(time = dense_rank(month_date)) %>%
+    ungroup() %>%
+    select(id, suff_reliable, time, all_of(yvar),
+           sufficient, uptime, uptime2, uptime3,
+           facilitytype, month_only, province, theft, bedcount,
+           wealth_mean, pop_density_mean, dist_paved_km_mean)
+
+  # Drop facilities with all-zero outcome
+  zero_ids <- ltmle_data %>%
+    group_by(id) %>%
+    summarise(all_zero = all(.data[[yvar]] == 0, na.rm = TRUE)) %>%
+    filter(all_zero) %>%
+    pull(id)
+
+  ltmle_data <- ltmle_data %>% filter(!id %in% zero_ids)
+
+  # Wide reshape
+  Y_wide <- ltmle_data %>%
+    select(id, time, suff_reliable, all_of(yvar)) %>%
+    pivot_wider(names_from = time, values_from = all_of(yvar), names_prefix = "Y_")
+
+  month_wide <- ltmle_data %>%
+    select(id, time, month_only) %>%
+    mutate(month_only = factor(month_only, levels = month.name)) %>%
+    pivot_wider(names_from = time, values_from = month_only, names_prefix = "L_month_")
+
+  controls <- ltmle_data %>%
+    filter(time == 1) %>%
+    select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean)
+
+  ltmle_wide <- Y_wide %>%
+    left_join(month_wide, by = "id") %>%
+    left_join(controls, by = "id")
+
+  # Nodes
+  Ynodes <- grep("^Y_", names(ltmle_wide), value = TRUE)
+  L_month_nodes <- grep("^L_month_", names(ltmle_wide), value = TRUE)
+
+  # Final prep
+  ltmle_ready <- ltmle_wide %>%
+    mutate(
+      suff_reliable = as.numeric(suff_reliable),
+      across(all_of(Ynodes), as.numeric),
+      across(all_of(L_month_nodes), ~ factor(., levels = month.name)),
+      facilitytype = as.factor(facilitytype),
+      province = as.factor(province),
+      theft = as.factor(theft),
+      wealth_mean = as.numeric(wealth_mean),
+      pop_density_mean = as.numeric(pop_density_mean),
+      dist_paved_km_mean = as.numeric(dist_paved_km_mean)
+    ) %>%
+    filter(!is.na(suff_reliable)) %>%
+    filter(!is.na(bedcount)) %>%
+    filter(!is.na(facilitytype), !is.na(province)) %>%
+    filter(if_all(all_of(Ynodes), ~ !is.na(.))) %>%
+    filter(if_any(all_of(L_month_nodes), ~ !is.na(.)))
+  
+  ltmle_ready_filtered <- ltmle_ready %>%
+    select(id, facilitytype, province, theft, bedcount, wealth_mean, pop_density_mean, dist_paved_km_mean, suff_reliable, all_of(L_month_nodes), all_of(Ynodes))
+
+  # Run TMLE
+  gform <- c(suff_reliable = "suff_reliable ~ id + province + facilitytype + theft + bedcount + wealth_mean + pop_density_mean + dist_paved_km_mean")
+  
+  set.seed(8675309)
+  
+  tmle_result_outcome2 <- ltmle(
+    data = ltmle_ready_filtered,
+    Anodes = "suff_reliable",
+    Lnodes = c(L_month_nodes),
+    Ynodes = Ynodes,
+    abar = list(treated = 1, untreated = 0),
+    SL.library = c("SL.glm", "SL.mean", "SL.gam", "SL.rpart",
+                   "SL.xgboost.custom", "SL.randomForest.custom"),
+    gform = gform
+  )
+
+  tmle_sum_outcome2 <- summary(tmle_result_outcome2)
+
+  # Save
+  tmle_fits_outcomes2[[yvar]] <- tmle_result_outcome2
+  tmle_results_list_outcomes2[[yvar]] <- data.frame(
+    outcome = yvar,
+    ate = tmle_sum_outcome2$effect.measures$ATE$estimate,
+    se = tmle_sum_outcome2$effect.measures$ATE$std.dev,
+    ci_low = tmle_sum_outcome2$effect.measures$ATE$CI[1],
+    ci_high = tmle_sum_outcome2$effect.measures$ATE$CI[2],
+    pval = tmle_sum_outcome2$effect.measures$ATE$pvalue,
+    control_mean = tmle_sum_outcome2$effect.measures$control$estimate,
+    treated_mean = tmle_sum_outcome2$effect.measures$treatment$estimate,
+    treated = sum(ltmle_ready$suff_reliable == 1, na.rm = TRUE),
+    control = sum(ltmle_ready$suff_reliable == 0, na.rm = TRUE)
+  )
+}
+
+# Combine results for outcome models
+tmle_results_outcomes_df2 <- bind_rows(tmle_results_list_outcomes2, .id = "model_name")
+
+tmle_results_outcomes_df2 <- tmle_results_outcomes_df2 %>%
+  mutate(
+    family = case_when(
+      outcome %in% c("mortrate_surgical", "mortrate_obgyn", 
+                     "mortrate_peds", "mortrate_internalmed") ~ "Mortality",
+      outcome %in% c("nurse_A1", "nurse_A2", "doctor", "labtech") ~ "Staffing",
+      outcome %in% c("outpatientcount", "admissions") ~ "Patient Volume",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  group_by(family) %>%
+  mutate(
+    pval_BH_group = p.adjust(pval, method = "BH")
+  ) %>%
+  ungroup() %>%
+  mutate(sig_BH_group = ifelse(pval_BH_group < 0.05, "*", ""))
+
+
+```
+
+## TWFE (Data prep)
+```{r sensordata, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+sensor_data_path <- file.path(
+  sensor_dir,
+  "pqr_climate_DRC.csv"
+)
+
+if (!file.exists(sensor_data_path)) {
+  message("Sensor PQR dataset not found. See README for access instructions.")
+  knitr::knit_exit()
+}
+
+sensordata <- read.csv(sensor_data_path)
+
+mapping <- c(
+  "CH Bethesda Ndosho" = "nk Bethesda Centre Hospitalier",
+  "CSR Kipese" = "nk Kipese Centre de Santé de Référence",
+  "CSR Kirumba" = "nk Kirumba Centre de Santé de Référence",
+  "CSR Kitsombiro" = "nk Kitsombiro Centre de Santé de Référence",
+  "CSR Kiziba" = "nk Kiziba Centre de Santé de Référence",
+  "HGR Beni" = "nk Beni Hôpital Général de Référence",
+  "HGR Katwa" = "nk Katwa Hôpital Général de Référence",
+  "HGR Kirotshe" = "nk Kirotshe Hôpital Général de Référence",
+  "HGR Kitatumba" = "nk Butembo/Kitatumba Hôpital Général de Référence",
+  "HGR Kyondo" = "nk Kyondo Hôpital Général de Référence",
+  "HGR Lubero" = "nk Lubero Hôpital Général de Référence",
+  "HGR Masisi" = "nk Masisi Hôpital Général de Référence",
+  "HGR Oicha" = "nk Oicha Hôpital Général de Référence",
+  "HGR Rutshuru" = "nk Rutshuru Hôpital Général de Référence",
+  "HGR Virunga" = "nk Virunga Hôpital Général de Référence",
+  "HGR Walikale" = "nk Walikale Hôpital Général de Référence",
+  "Heal Africa" = "nk Heal Africa Hôpital",
+  "Hôpital Provincial" = "nk Nord-Kivu Hôpital Provincial de Référence"
+)
+
+sensordata <- sensordata %>%
+  mutate(site_name = recode_factor(site_name, !!!mapping)) %>%
+  rename(organisationunitname = site_name)
+
+sensordata <- sensordata %>%
+  mutate(date = as.Date(date, format = "%m/%d/%Y"),
+         month_date = floor_date(date, "month"))
+
+# Step 2: Collapse to one row per facility × month
+sensordata_monthly <- sensordata %>%
+  group_by(organisationunitname, month_date) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+
+range(snis_analytical$month_date)
+range(sensordata_monthly$month_date)
+
+merged_data <- snis_analytical %>%
+  inner_join(sensordata_monthly, by = c("organisationunitname", "month_date"))
+
+merged_data <- merged_data %>%
+  mutate(uptime_sensor = (24 - daily_outage_hrs) / 24 * 100)
+
+summary(merged_data$uptime_sensor)
+
+# Count and percentage of observations below 91.7% uptime
+below_threshold <- sum(merged_data$uptime_sensor < 91.7, na.rm = TRUE)
+total_obs <- sum(!is.na(merged_data$uptime_sensor))
+percent_below <- (below_threshold / total_obs) * 100
+
+cat("Number of observations with uptime < 91.7%:", below_threshold, "\n")
+cat("Total non-missing observations:", total_obs, "\n")
+cat("Percentage below 91.7%:", round(percent_below, 2), "%\n")
+```
+
+## TWFE (Within facility analysis) - Main Results Table 4
+```{r withinfacility, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+
+#-------------------------------------------------------------
+# 1. Create binary reliability variable (> 91.7%)
+#-------------------------------------------------------------
+merged_data <- merged_data %>%
+  mutate(
+    reliable_binary = ifelse(uptime_sensor > 91.7, 1, 0)
+  )
+
+merged_data %>%
+  group_by(reliable_binary) %>%
+  summarize(
+    mean_mortality = mean(mortrate_active, na.rm = TRUE),
+    sd_mortality   = sd(mortrate_active, na.rm = TRUE),
+    n_obs          = n()
+  )
+
+
+#-------------------------------------------------------------
+# 2. Run models but using binary variable
+#-------------------------------------------------------------
+
+# Naïve model (no controls)
+fe_tw_reliable_naive <- felm(
+  mortrate_active ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+
+# Full model (with controls)
+fe_tw_reliable <- felm(
+  mortrate_active ~ reliable_binary + outpatientcount + inpatientcount_active +
+    nurse_A1 + labtech | id + month_date,
+  data = merged_data
+)
+
+#-------------------------------------------------------------
+# 3. Lagged versions of binary reliability
+#-------------------------------------------------------------
+merged_data <- merged_data %>%
+  group_by(id) %>%
+  arrange(month_date, .by_group = TRUE) %>%
+  mutate(
+    reliable_lag1 = dplyr::lag(reliable_binary, 1),
+    reliable_lag2 = dplyr::lag(reliable_binary, 2)
+  ) %>%
+  ungroup()
+
+
+# Naïve lagged models
+fe_tw_reliable_lag_naive <- felm(
+  mortrate_active ~ reliable_lag1 | id + month_date,
+  data = merged_data
+)
+
+# Full lagged models with controls
+fe_tw_reliable_lag <- felm(
+  mortrate_active ~ reliable_lag1 + outpatientcount + inpatientcount_active +
+    nurse_A1 + labtech | id + month_date,
+  data = merged_data
+)
+
+#-------------------------------------------------------------
+# 4. Display model summaries
+#-------------------------------------------------------------
+coeftest(fe_tw_reliable_naive,
+         vcov = vcovCR(fe_tw_reliable_naive,
+                       cluster = merged_data$id,
+                       type = "CR2"))
+
+coeftest(fe_tw_reliable,
+         vcov = vcovCR(fe_tw_reliable,
+                       cluster = merged_data$id,
+                       type = "CR2"))
+
+coeftest(fe_tw_reliable_lag_naive,
+         vcov = vcovCR(fe_tw_reliable_lag_naive,
+                       cluster = merged_data$id,
+                       type = "CR2"))
+
+coeftest(fe_tw_reliable_lag,
+         vcov = vcovCR(fe_tw_reliable_lag,
+                       cluster = merged_data$id,
+                       type = "CR2"))
+
+twfe_inpatient <- felm(
+  inpatientcount_active ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_outpatient <- felm(
+  outpatientcount ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_surg <- felm(
+  mortrate_surgical ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_obgyn <- felm(
+  mortrate_obgyn ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_peds <- felm(
+  mortrate_peds ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_internalmed <- felm(
+  mortrate_internalmed ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_nurse_A1 <- felm(
+  nurse_A1 ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_nurse_A2 <- felm(
+  nurse_A2 ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_doctor <- felm(
+  doctor ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+twfe_labtech <- felm(
+  labtech ~ reliable_binary | id + month_date,
+  data = merged_data
+)
+```
+
+## TWFE (Plots) - Figure 4
+```{r twfe_shiftcutoff, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+# --- 1. Run models for cutoffs 85–95 ---
+cutoff_results <- data.frame()
+
+for (c in 85:95) {
+  
+  merged_data <- merged_data %>%
+    mutate(reliable_binary = ifelse(uptime_sensor > c, 1, 0))
+  
+  model <- felm(
+    mortrate_active ~ reliable_binary + outpatientcount + inpatientcount_active +
+      nurse_A1 + labtech | id + month_date,
+    data = merged_data
+  )
+  
+  rel_row <- broom::tidy(model) %>% filter(term == "reliable_binary")
+  
+  cutoff_results <- rbind(
+    cutoff_results,
+    data.frame(
+      cutoff = c / 100,
+      estimate = rel_row$estimate,
+      std_error = rel_row$std.error,
+      ci_low = rel_row$estimate - 1.96 * rel_row$std.error,
+      ci_high = rel_row$estimate + 1.96 * rel_row$std.error,
+      p_value = rel_row$p.value,
+      n_obs = nobs(model)
+    )
+  )
+}
+
+# --- 2. Plot (matching TMLE aesthetic) ---
+p_twfe_cutoffs <- ggplot(cutoff_results, aes(x = cutoff, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.2, fill = "#542788") +
+  geom_line(color = "#542788", linewidth = 1.2) +
+  geom_point(color = "#542788", size = 2) +
+  scale_x_continuous(breaks = seq(0.85, 0.99, 0.01), labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Shifting Reliability Cutoff (TWFE Sensor Models)",
+    x = NULL,
+    y = "Coefficient on Reliable (> cutoff)"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 0, vjust = 0.5),
+    panel.grid.minor = element_blank()
+  )
+
+# --- 3. Display ---
+print(p_twfe_cutoffs)
+
+
+```
+
+## SENSOR vs. SURVEY (comparison of uptime measures) - Supplementary Materials Table S1
+```{r uptimedefs, echo=FALSE, message=FALSE, warning=FALSE, include=TRUE}
+merged_data <- merged_data %>%
+  mutate(
+    uptime  = as.numeric(uptime),
+    uptime2 = as.numeric(uptime2),
+    uptime3 = as.numeric(uptime3),
+    uptime_sensor = as.numeric(uptime_sensor)
+  )
+
+# Collapse sensor measure to facility-level average
+facility_avgs <- merged_data %>%
+  group_by(id) %>%
+  summarise(
+    avg_sensor_uptime = mean(uptime_sensor, na.rm = TRUE),
+    survey_uptime1 = first(uptime),   
+    survey_uptime2 = first(uptime2),
+    survey_uptime3 = first(uptime3)
+  )
+
+# Correlations across facilities
+cor_results <- facility_avgs %>%
+  summarise(
+    cor_uptime1 = cor(survey_uptime1, avg_sensor_uptime, use = "complete.obs"),
+    cor_uptime2 = cor(survey_uptime2, avg_sensor_uptime, use = "complete.obs"),
+    cor_uptime3 = cor(survey_uptime3, avg_sensor_uptime, use = "complete.obs")
+  )
+
+print(cor_results)
+
+# R² values from regressions
+lm_uptime1 <- summary(lm(avg_sensor_uptime ~ survey_uptime1, data = facility_avgs))
+lm_uptime2 <- summary(lm(avg_sensor_uptime ~ survey_uptime2, data = facility_avgs))
+lm_uptime3 <- summary(lm(avg_sensor_uptime ~ survey_uptime3, data = facility_avgs))
+
+r2_results <- tibble(
+  R2_uptime1 = lm_uptime1$r.squared,
+  R2_uptime2 = lm_uptime2$r.squared,
+  R2_uptime3 = lm_uptime3$r.squared
+)
+
+lm_uptime1 <- lm(avg_sensor_uptime ~ survey_uptime1, data = facility_avgs)
+summary(lm_uptime1)
+
+lm_uptime2 <- lm(avg_sensor_uptime ~ survey_uptime2, data = facility_avgs)
+summary(lm_uptime2)
+
+lm_uptime3 <- lm(avg_sensor_uptime ~ survey_uptime3, data = facility_avgs)
+summary(lm_uptime3)
+
+
+print(r2_results)
+
+# Define 91.7% threshold
+cutoff <- 0.917
+cutoff2 <- 91.7
+
+p1 <- ggplot(facility_avgs, aes(x = survey_uptime1, y = avg_sensor_uptime)) +
+  geom_point(alpha = 0.6, color = "#542788") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  geom_vline(xintercept = cutoff, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = cutoff2, linetype = "dashed", color = "red") +
+  labs(x = "Survey uptime1", y = "Average sensor uptime")
+
+p2 <- ggplot(facility_avgs, aes(x = survey_uptime2, y = avg_sensor_uptime)) +
+  geom_point(alpha = 0.6, color = "#542788") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  geom_vline(xintercept = cutoff, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = cutoff2, linetype = "dashed", color = "red") +
+  labs(x = "Survey uptime2", y = "Average sensor uptime")
+
+p3 <- ggplot(facility_avgs, aes(x = survey_uptime3, y = avg_sensor_uptime)) +
+  geom_point(alpha = 0.6, color = "#542788") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  geom_vline(xintercept = cutoff, linetype = "dashed", color = "red") +
+  geom_hline(yintercept = cutoff2, linetype = "dashed", color = "red") +
+  labs(x = "Survey uptime3", y = "Average sensor uptime")
+
+# Combine plots
+p1 + p2 + p3
+
+```
